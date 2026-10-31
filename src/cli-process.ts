@@ -21,6 +21,33 @@
  * are answered here, attached or not — the CLI must never wait on one.
  */
 
+// TEMP DEBUG (TASK-232): lifecycle metadata only; logging must not affect process handling.
+import { appendFileSync } from "node:fs";
+function debugLifecycle(
+  kind: string,
+  cli?: CliProcess,
+  details: Record<string, unknown> = {},
+): void {
+  try {
+    appendFileSync(
+      "/tmp/pi-claude-cli-debug.jsonl",
+      JSON.stringify({
+        t: new Date().toISOString(),
+        pid: process.pid,
+        kind,
+        cliSessionId: cli?.cliSessionId,
+        cliPid: cli?.proc.pid,
+        alive: cli?.alive,
+        retired: cli?.retired,
+        turnActive: cli?.turnActive,
+        ...details,
+      }) + "\n",
+    );
+  } catch {
+    /* debug must never break a turn */
+  }
+}
+// END TEMP DEBUG (TASK-232)
 import type { ChildProcess } from "node:child_process";
 import { createInterface } from "node:readline";
 import { parseLine } from "./stream-parser.js";
@@ -144,7 +171,13 @@ export class CliProcess implements HandoffTarget {
   piHistory?: {
     length: number;
     hash: string;
-    messageHashes: { role: string; hash: string }[];
+    messageHashes: {
+      role: string;
+      hash: string;
+      // TEMP DEBUG (TASK-232)
+      blockTypes?: string[];
+      // END TEMP DEBUG (TASK-232)
+    }[];
   };
   /**
    * The thinking the CLI will use for its next user turn: the spawn flags,
@@ -225,7 +258,10 @@ export class CliProcess implements HandoffTarget {
     proc.on("error", (err: Error) => {
       this.sink?.onError(err);
     });
-    proc.on("close", (code: number | null) => {
+    proc.on("close", (code: number | null, signal: NodeJS.Signals | null) => {
+      // TEMP DEBUG (TASK-232)
+      debugLifecycle("process-close", this, { code, signal });
+      // END TEMP DEBUG (TASK-232)
       this.exitCode = code;
       this.handleProcClose(code);
     });
@@ -451,7 +487,11 @@ export class CliProcess implements HandoffTarget {
    * with synthetic filler). Resolves once the process has closed or been
    * force-killed.
    */
-  retire(): Promise<void> {
+  retire(reason = "unspecified"): Promise<void> {
+    // TEMP DEBUG (TASK-232): reason only
+    // TEMP DEBUG (TASK-232)
+    debugLifecycle("retire", this, { reason });
+    // END TEMP DEBUG (TASK-232)
     if (this.retired) return this.waitClosed();
     this.retired = true;
     removeSessionMcpConfig(this.cliSessionId);
@@ -543,6 +583,9 @@ export class CliProcess implements HandoffTarget {
   private stdoutClosed = false;
   private handleStdoutClose(): void {
     if (this.stdoutClosed) return;
+    // TEMP DEBUG (TASK-232)
+    debugLifecycle("stdout-close", this);
+    // END TEMP DEBUG (TASK-232)
     this.stdoutClosed = true;
     // No more output means no result is coming: the turn is over.
     this.turnActive = false;
@@ -580,15 +623,21 @@ export function parkCliProcess(
   cli: CliProcess,
   idleMs: number,
 ): void {
+  // TEMP DEBUG (TASK-232)
+  debugLifecycle("park", cli, { session: piSessionId, idleMs });
+  // END TEMP DEBUG (TASK-232)
   const previous = parked.get(piSessionId);
-  if (previous && previous !== cli) void previous.retire();
+  if (previous && previous !== cli) void previous.retire("pool-replaced"); // TEMP DEBUG (TASK-232): reason only
   parked.set(piSessionId, cli);
   cli.onExit(() => {
     if (parked.get(piSessionId) === cli) parked.delete(piSessionId);
   });
   cli.startIdleTimer(idleMs, () => {
+    // TEMP DEBUG (TASK-232)
+    debugLifecycle("park-expired", cli, { session: piSessionId, idleMs });
+    // END TEMP DEBUG (TASK-232)
     if (parked.get(piSessionId) === cli) parked.delete(piSessionId);
-    void cli.retire();
+    void cli.retire("park-expired"); // TEMP DEBUG (TASK-232): reason only
   });
 }
 
@@ -597,6 +646,9 @@ export function takeParkedCliProcess(
   piSessionId: string,
 ): CliProcess | undefined {
   const cli = parked.get(piSessionId);
+  // TEMP DEBUG (TASK-232)
+  debugLifecycle("take", cli, { session: piSessionId, found: !!cli });
+  // END TEMP DEBUG (TASK-232)
   if (!cli) return undefined;
   parked.delete(piSessionId);
   cli.clearIdleTimer();
@@ -620,8 +672,14 @@ export function resetCliProcessesForTests(): void {
 }
 
 /** Retire every parked process (extension teardown, tests). */
-export async function retireAllCliProcesses(): Promise<void> {
+export async function retireAllCliProcesses(
+  reason = "unspecified",
+): Promise<void> {
+  // TEMP DEBUG (TASK-232): reason only
   const all = [...parked.values()];
+  // TEMP DEBUG (TASK-232)
+  debugLifecycle("retire-all", undefined, { reason, count: all.length });
+  // END TEMP DEBUG (TASK-232)
   parked.clear();
-  await Promise.all(all.map((cli) => cli.retire()));
+  await Promise.all(all.map((cli) => cli.retire(reason)));
 }

@@ -79,7 +79,14 @@ import {
 } from "./cli-process.js";
 import type { HandoffResult } from "./handoff-broker.js";
 import { handoffSecretFile } from "./handoff-broker.js";
-import { randomUUID } from "node:crypto";
+import { randomUUID, createHash } from "node:crypto";
+// TEMP DEBUG (TASK-227): spawn-reason log; restore /tmp/pi-claude-cli-provider.ts.orig to remove.
+import { appendFileSync } from "node:fs";
+const dbgHash = (v: unknown) =>
+  createHash("sha256")
+    .update(JSON.stringify(v ?? null))
+    .digest("hex")
+    .slice(0, 10);
 import {
   piContext as normalizePiContext,
   historyHash,
@@ -484,10 +491,86 @@ export function streamViaCli(
       const parkedCli = piSessionId
         ? takeParkedCliProcess(piSessionId)
         : undefined;
+      const dbg: Record<string, unknown> = {
+        t: new Date().toISOString(),
+        pid: process.pid,
+        session: piSessionId,
+        model: model.id,
+        n: messages.length,
+        piOwned,
+        stale,
+        forceFullReplay,
+        parked: !!parkedCli,
+        delta: delta.map(
+          (m) => m?.role + (m?.toolName ? `:${m.toolName}` : ""),
+        ),
+        sig: dbgHash(signature),
+      };
       if (parkedCli) {
         const checkpoint = parkedCli.piHistory;
         const historyMatches =
           !piOwned || piHistoryMatches(messages, checkpoint);
+        dbg.historyMatches = historyMatches;
+        dbg.checkpointLen = checkpoint?.length;
+        dbg.sigEq = parkedCli.signature === signature;
+        dbg.parkedSig = dbgHash(parkedCli.signature);
+        dbg.turnActive = parkedCli.turnActive;
+        // TEMP DEBUG (TASK-232): locate the first failed non-user checkpoint entry; no content.
+        if (!historyMatches && checkpoint) {
+          try {
+            let currentIndex = 0;
+            for (const [
+              checkpointIndex,
+              entry,
+            ] of checkpoint.messageHashes.entries()) {
+              const current = messages[currentIndex];
+              const currentHash = current ? historyHash([current]) : null;
+              if (entry.hash === currentHash) currentIndex++;
+              else if (entry.role !== "user") {
+                dbg.historyMismatch = {
+                  checkpointIndex,
+                  currentIndex,
+                  checkpoint: {
+                    role: entry.role,
+                    hash: entry.hash,
+                    blockTypes: entry.blockTypes,
+                  },
+                  current: current
+                    ? {
+                        role: current.role,
+                        hash: currentHash,
+                        blockTypes: Array.isArray(current.content)
+                          ? current.content.map((block: any) =>
+                              [
+                                "text",
+                                "thinking",
+                                "redacted_thinking",
+                                "toolCall",
+                                "image",
+                              ].includes(block?.type)
+                                ? block.type
+                                : "other",
+                            )
+                          : typeof current.content === "string"
+                            ? ["string"]
+                            : [],
+                      }
+                    : null,
+                };
+                break;
+              }
+            }
+          } catch {
+            /* debug must never break a turn */
+          }
+        }
+        // END TEMP DEBUG (TASK-232)
+        if (!historyMatches && checkpoint) {
+          dbg.checkpointHashNow = historyHash(
+            messages.slice(0, checkpoint.length),
+          ).slice(0, 10);
+          dbg.checkpointHashThen = checkpoint.hash.slice(0, 10);
+        }
         if (
           !forceFullReplay &&
           !stale &&
@@ -520,16 +603,20 @@ export function streamViaCli(
         // the turn it is continuing: the CLI reads thinking once per user
         // turn, so a change made mid-turn applies from the next one.
         if (mode === "turn" && !(await parkedCli.applyThinking(thinking))) {
+          // TEMP DEBUG (TASK-232)
+          dbg.thinkingApplyFailed = true;
+          // END TEMP DEBUG (TASK-232)
           mode = "spawn";
         }
         if (mode === "spawn") {
           // Different spawn parameters, stale history, or a delta the live
           // process cannot take: end it cleanly and start over via --resume.
-          await parkedCli.retire();
+          await parkedCli.retire("reuse-rejected"); // TEMP DEBUG (TASK-232): reason only
         } else {
           cli = parkedCli;
         }
       }
+      dbg.mode = mode;
 
       // ---- 2. Or spawn
       let resumeSessionId: string | undefined;
@@ -567,6 +654,13 @@ export function streamViaCli(
         const systemPrompt =
           storedSystemPrompt ??
           buildSystemPrompt(context, cwd, systemPromptMode);
+        dbg.systemPrompt = dbgHash(systemPrompt);
+        dbg.systemPromptLen = systemPrompt?.length;
+        dbg.prompt = dbgHash(prompt);
+        // Per-message replay hashes: diff consecutive spawns to find the first changed message.
+        dbg.msgHashes = messages.map((m: any) =>
+          dbgHash(piOwned ? replayPiMessages([m]) : m?.content),
+        );
 
         // The MCP config names this CLI session so proxied tool calls route
         // back here. A verbatim mcpConfigPath (tests, legacy hosts) wins.
@@ -612,6 +706,18 @@ export function streamViaCli(
         cli.writeUser(prompt);
       }
 
+      // TEMP DEBUG (TASK-232): correlate provider decisions with process lifecycle.
+      dbg.kind = "provider-decision";
+      dbg.cliSessionId = cli.cliSessionId;
+      // END TEMP DEBUG (TASK-232)
+      try {
+        appendFileSync(
+          "/tmp/pi-claude-cli-debug.jsonl",
+          JSON.stringify(dbg) + "\n",
+        );
+      } catch {
+        /* debug log must never break a turn */
+      }
       const live = cli;
       const proc = live.proc;
 
@@ -683,7 +789,7 @@ export function streamViaCli(
         stream.end();
         // An episode that failed cannot vouch for the process it was
         // attached to; end it rather than park it for the next call.
-        void live.retire();
+        void live.retire(aborted ? "abort" : "episode-error"); // TEMP DEBUG (TASK-232): reason only
         finishEpisode();
       }
 
@@ -692,7 +798,7 @@ export function streamViaCli(
         if (piSessionId) {
           // Nothing to do — the pool never held it while attached.
         }
-        await live.retire();
+        await live.retire("partial-work-discard"); // TEMP DEBUG (TASK-232): reason only
         removeSessionMcpConfig(live.cliSessionId);
       }
 
@@ -700,7 +806,7 @@ export function streamViaCli(
       function releaseProcess(reason: "turn-end" | "handoff") {
         if (!live.alive || live.retired) return;
         if (!piSessionId) {
-          void live.retire();
+          void live.retire("no-pi-session"); // TEMP DEBUG (TASK-232): reason only
           return;
         }
         if (reason === "handoff") {
@@ -709,7 +815,7 @@ export function streamViaCli(
         }
         const idle = keepaliveMs();
         if (idle > 0) parkCliProcess(piSessionId, live, idle);
-        else void live.retire();
+        else void live.retire("keepalive-disabled"); // TEMP DEBUG (TASK-232): reason only
       }
 
       // Inactivity timeout: kill subprocess if no stdout for INACTIVITY_TIMEOUT_MS
@@ -842,7 +948,7 @@ export function streamViaCli(
           }
           // stdout closed without a result: end on whatever was streamed.
           // The process is gone or going; it cannot serve another call.
-          void live.retire();
+          void live.retire("stdout-closed"); // TEMP DEBUG (TASK-232): reason only
           finishEpisode();
         },
         onMessage(msg) {
@@ -1054,7 +1160,7 @@ export function streamViaCli(
             // the result pasted in can continue it).
             live.turnReported = ZERO_USAGE;
             if (selfInterrupted && !aborted) {
-              void live.retire();
+              void live.retire("self-interrupted"); // TEMP DEBUG (TASK-232): reason only
             } else {
               releaseProcess("turn-end");
             }
@@ -1121,6 +1227,23 @@ export function streamViaCli(
             messageHashes: acknowledged.map((message) => ({
               role: message.role,
               hash: historyHash([message]),
+              // TEMP DEBUG (TASK-232): retain only block kinds, never block contents.
+              blockTypes: Array.isArray(message.content)
+                ? message.content.map((block: any) =>
+                    [
+                      "text",
+                      "thinking",
+                      "redacted_thinking",
+                      "toolCall",
+                      "image",
+                    ].includes(block?.type)
+                      ? block.type
+                      : "other",
+                  )
+                : typeof message.content === "string"
+                  ? ["string"]
+                  : [],
+              // END TEMP DEBUG (TASK-232)
             })),
           };
         }
