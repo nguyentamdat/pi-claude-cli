@@ -98,18 +98,18 @@ const text = (t: string) =>
     delta: { type: "text_delta", text: t },
   }) +
   ev({ type: "content_block_stop", index: 0 });
-const handoffToolUse = (id: string, name: string, args: any) =>
+const handoffToolUse = (id: string, name: string, args: any, index = 0) =>
   ev({
     type: "content_block_start",
-    index: 0,
+    index,
     content_block: { type: "tool_use", id, name, input: "" },
   }) +
   ev({
     type: "content_block_delta",
-    index: 0,
+    index,
     delta: { type: "input_json_delta", partial_json: JSON.stringify(args) },
   }) +
-  ev({ type: "content_block_stop", index: 0 });
+  ev({ type: "content_block_stop", index });
 const endCycle = (stop: string, output = 5) =>
   ev({
     type: "message_delta",
@@ -253,6 +253,83 @@ describe("persistent CLI process", () => {
     });
   });
 
+  describe("piHistoryMatches continuity", () => {
+    it.each([
+      "disappearing injection",
+      "changed assistant",
+      "changed toolResult",
+      "missing final assistant",
+      "missing earlier assistant",
+      "missing toolResult",
+      "reordered non-user messages",
+    ])("checks %s before reusing the process", async (change) => {
+      process.env.PI_CLAUDE_CLI_CONTEXT = "pi";
+      const ctx = {
+        messages: [
+          { role: "user", content: "first" },
+          ourAssistant([
+            { type: "toolCall", id: "old", name: "search", arguments: {} },
+          ]),
+          {
+            role: "toolResult",
+            toolCallId: "old",
+            toolName: "search",
+            content: [{ type: "text", text: "old result" }],
+          },
+          { role: "user", content: "request-only injection" },
+        ],
+      };
+      streamViaCli(model, ctx, opts("checkpoint") as any);
+      await vi.advanceTimersByTimeAsync(0);
+      const proc = procAt(0);
+      proc.stdout.write(
+        startCycle({ input_tokens: 1 }) +
+          text("one") +
+          endCycle("end_turn") +
+          result(),
+      );
+      await vi.advanceTimersByTimeAsync(10);
+
+      // The request-only injection is absent in the next pi transcript.
+      const messages: any[] = [
+        ...ctx.messages.slice(0, -1),
+        ourAssistant(doneOf(0).message.content),
+      ];
+      if (change === "changed assistant")
+        messages[1] = ourAssistant([
+          { type: "text", text: "edited assistant" },
+        ]);
+      if (change === "changed toolResult")
+        messages[2] = {
+          ...messages[2],
+          content: [{ type: "text", text: "edited result" }],
+        };
+      if (change === "missing final assistant") messages.pop();
+      if (change === "missing earlier assistant") messages.splice(1, 1);
+      if (change === "missing toolResult") messages.splice(2, 1);
+      if (change === "reordered non-user messages")
+        [messages[1], messages[2]] = [messages[2], messages[1]];
+      messages.push({ role: "user", content: "follow-up" });
+      streamViaCli(model, { messages }, opts("checkpoint") as any);
+      await vi.advanceTimersByTimeAsync(600);
+
+      const matches = change === "disappearing injection";
+      expect(spawn).toHaveBeenCalledTimes(matches ? 1 : 2);
+      const active = matches ? proc : procAt(1);
+      expect(written(active).join("")).toContain("follow-up");
+      if (matches) expect(proc.stdin.end).not.toHaveBeenCalled();
+      else expect(proc.stdin.end).toHaveBeenCalled();
+      active.stdout.write(
+        startCycle({ input_tokens: 1 }) +
+          text("two") +
+          endCycle("end_turn") +
+          result(),
+      );
+      await vi.advanceTimersByTimeAsync(10);
+      expect(doneOf(1).message.stopReason).toBe("stop");
+    });
+  });
+
   describe("default pi ownership", () => {
     it("returns a structured abort before spawning", () => {
       delete process.env.PI_CLAUDE_CLI_CONTEXT;
@@ -351,6 +428,114 @@ describe("persistent CLI process", () => {
   });
 
   describe("proxied handoff", () => {
+    it.each([
+      "trailing steer",
+      "interleaved steer",
+      "unsupported steer",
+      "legacy steer",
+    ])(
+      "only carries ordered, lossless pi-owned user content: %s",
+      async (scenario) => {
+        if (scenario !== "legacy steer")
+          process.env.PI_CLAUDE_CLI_CONTEXT = "pi";
+        const ctx = { messages: [{ role: "user", content: "search twice" }] };
+        streamViaCli(model, ctx, opts("steer") as any);
+        await vi.advanceTimersByTimeAsync(0);
+        const proc = procAt(0);
+        proc.stdout.write(
+          startCycle({ input_tokens: 1 }) +
+            handoffToolUse("t1", "mcp__custom-tools__search", {}, 0) +
+            handoffToolUse("t2", "mcp__custom-tools__search", {}, 1) +
+            endCycle("tool_use"),
+        );
+        await vi.advanceTimersByTimeAsync(10);
+        expect(
+          doneOf(0).message.content.filter((c: any) => c.type === "toolCall"),
+        ).toHaveLength(2);
+        const answers: HandoffResult[] = [];
+        for (const toolUseId of ["t1", "t2"]) {
+          dispatchHandoffCall(cliIdOf(0), {
+            toolUseId,
+            name: "search",
+            arguments: {},
+            respond: (answer) => answers.push(answer),
+          });
+        }
+        const toolResults = ["t1", "t2"].map((toolCallId) => ({
+          role: "toolResult",
+          toolCallId,
+          toolName: "search",
+          content: [{ type: "text", text: toolCallId + " result" }],
+        }));
+        const users: any[] = [
+          { role: "user", content: "Search only recent releases." },
+          {
+            role: "user",
+            content: [
+              { type: "text", text: "Use this screenshot." },
+              { type: "image", data: "cG5n", mimeType: "image/png" },
+            ],
+          },
+        ];
+        if (scenario === "unsupported steer")
+          users[1].content.push({ type: "audio", data: "YXVkaW8=" });
+        const delta =
+          scenario === "interleaved steer"
+            ? [toolResults[0], users[0], toolResults[1], users[1]]
+            : [...toolResults, ...users];
+        streamViaCli(
+          model,
+          {
+            messages: [
+              ...ctx.messages,
+              ourAssistant(doneOf(0).message.content),
+              ...delta,
+            ],
+          },
+          opts("steer") as any,
+        );
+        await vi.advanceTimersByTimeAsync(2600);
+
+        const continues = scenario === "trailing steer";
+        expect(spawn).toHaveBeenCalledTimes(continues ? 1 : 2);
+        if (continues) {
+          expect(answers).toEqual([
+            { content: toolResults[0].content },
+            {
+              content: [
+                ...toolResults[1].content,
+                {
+                  type: "text",
+                  text: "[User message received while the tool ran]",
+                },
+                { type: "text", text: users[0].content },
+                {
+                  type: "text",
+                  text: "[User message received while the tool ran]",
+                },
+                ...users[1].content,
+              ],
+            },
+          ]);
+          expect(
+            written(proc).filter((w: string) => JSON.parse(w).type === "user"),
+          ).toHaveLength(1);
+          expect(proc.stdin.end).not.toHaveBeenCalled();
+        } else {
+          expect(proc.stdin.end).toHaveBeenCalled();
+        }
+        const active = continues ? proc : procAt(1);
+        active.stdout.write(
+          startCycle({ input_tokens: 1 }) +
+            text("done") +
+            endCycle("end_turn") +
+            result(),
+        );
+        await vi.advanceTimersByTimeAsync(10);
+        expect(doneOf(1).message.stopReason).toBe("stop");
+      },
+    );
+
     it("hands the tool to pi WITHOUT interrupting, then answers the CLI's tools/call from the next pi call on the same process", async () => {
       delete process.env.PI_CLAUDE_CLI_CONTEXT;
       const ctx1 = { messages: [{ role: "user", content: "search please" }] };

@@ -141,7 +141,11 @@ export class CliProcess implements HandoffTarget {
   readonly allowHandoff: boolean;
   readonly getStderr: () => string;
   /** Pi history acknowledged by this disposable process, never a second ledger. */
-  piHistory?: { length: number; hash: string };
+  piHistory?: {
+    length: number;
+    hash: string;
+    messageHashes: { role: string; hash: string }[];
+  };
   /**
    * The thinking the CLI will use for its next user turn: the spawn flags,
    * then every change `applyThinking` got acknowledged.

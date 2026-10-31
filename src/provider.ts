@@ -244,6 +244,21 @@ function cliSessionIsStale(messages: any[]): boolean {
   return false; // no assistant turns at all: nothing to be behind
 }
 
+/** Request-only user injections may disappear; all other checkpoint entries must match. */
+function piHistoryMatches(
+  messages: any[],
+  checkpoint: CliProcess["piHistory"],
+): boolean {
+  if (!checkpoint) return false;
+  const hashes = messages.map((message) => historyHash([message]));
+  let index = 0;
+  for (const entry of checkpoint.messageHashes) {
+    if (entry.hash === hashes[index]) index++;
+    else if (entry.role !== "user") return false;
+  }
+  return true;
+}
+
 /** Messages after the last assistant turn: what this call adds. */
 function deltaMessages(messages: any[]): any[] {
   let lastAssistantIdx = -1;
@@ -254,6 +269,23 @@ function deltaMessages(messages: any[]): any[] {
     }
   }
   return messages.slice(lastAssistantIdx + 1);
+}
+
+/** Only losslessly representable user content may ride the final handoff result. */
+function canAppendHandoffUser(message: any): boolean {
+  const content = message?.content;
+  return (
+    message?.role === "user" &&
+    (typeof content === "string" ||
+      (Array.isArray(content) &&
+        content.every(
+          (block) =>
+            (block?.type === "text" && typeof block.text === "string") ||
+            (block?.type === "image" &&
+              typeof block.data === "string" &&
+              typeof block.mimeType === "string"),
+        )))
+  );
 }
 
 /** pi toolResult content → MCP tool result the CLI understands. */
@@ -455,11 +487,7 @@ export function streamViaCli(
       if (parkedCli) {
         const checkpoint = parkedCli.piHistory;
         const historyMatches =
-          !piOwned ||
-          (!!checkpoint &&
-            messages.length >= checkpoint.length &&
-            historyHash(messages.slice(0, checkpoint.length)) ===
-              checkpoint.hash);
+          !piOwned || piHistoryMatches(messages, checkpoint);
         if (
           !forceFullReplay &&
           !stale &&
@@ -469,12 +497,18 @@ export function streamViaCli(
           const toolResults = delta.filter((m) => m?.role === "toolResult");
           const userMessages = delta.filter((m) => m?.role === "user");
           if (parkedCli.turnActive) {
-            // Blocked in a proxied handoff: only pi's results for exactly
-            // those tool calls can continue the turn in-process.
+            // Pi-owned handoffs may carry ordered user steers in the final result.
+            // Other deltas still require a replay.
             const ids = toolResults.map((m) => String(m.toolCallId ?? ""));
             if (
-              toolResults.length === delta.length &&
-              parkedCli.canContinueHandoff(ids)
+              parkedCli.canContinueHandoff(ids) &&
+              (toolResults.length === delta.length ||
+                (piOwned &&
+                  delta.every((message, index) =>
+                    index < toolResults.length
+                      ? message?.role === "toolResult"
+                      : canAppendHandoffUser(message),
+                  )))
             ) {
               mode = "handoff";
             }
@@ -1035,12 +1069,22 @@ export function streamViaCli(
 
       // Continue the parked process
       if (mode === "handoff") {
-        for (const m of delta) {
-          if (m?.role !== "toolResult") continue;
-          live.deliverHandoffResult(
-            String(m.toolCallId ?? ""),
-            toHandoffResult(m),
-          );
+        const toolResults = delta.filter((m) => m?.role === "toolResult");
+        for (const [index, m] of toolResults.entries()) {
+          const result = toHandoffResult(m);
+          // Keep steers in this continuation without relying on active-turn stdin behavior.
+          if (piOwned && index === toolResults.length - 1) {
+            for (const user of delta.slice(toolResults.length)) {
+              result.content.push(
+                {
+                  type: "text",
+                  text: "[User message received while the tool ran]",
+                },
+                ...toHandoffResult(user).content,
+              );
+            }
+          }
+          live.deliverHandoffResult(String(m.toolCallId ?? ""), result);
         }
       } else if (mode === "turn") {
         live.writeUser(
@@ -1074,6 +1118,10 @@ export function streamViaCli(
           live.piHistory = {
             length: acknowledged.length,
             hash: historyHash(acknowledged),
+            messageHashes: acknowledged.map((message) => ({
+              role: message.role,
+              hash: historyHash([message]),
+            })),
           };
         }
         streamEnded = true;
