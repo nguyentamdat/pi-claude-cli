@@ -727,16 +727,21 @@ quota.
 ## Account state: rate limits (0.4.5)
 
 The CLI emits a `rate_limit_event` envelope describing the **account's**
-plan window. This is not turn content and must never become any: it says
-nothing about the answer being streamed, and folding it into the message
-would put account state into the user's transcript and into pi's session
-file. It travels a separate path end to end:
+plan window. It is not assistant content; account status travels separately:
 
 ```
-provider.ts   rate_limit_event → options.onRateLimit(info)   (never touches pi's stream)
+provider.ts   rate_limit_event → options.onRateLimit(info)
 index.ts      publishRateLimit → ctx.ui.setStatus("claude-rate-limit", json)
 front-end     reads the status key, renders it however it likes
 ```
+
+For errors or short CLI quota-notice stops, the latest event in that turn also
+adds a native `AssistantMessage.diagnostics` entry when its top-level `status`
+is `"rejected"`: `{ type: "claude-limit", timestamp, details: { status: "rejected",
+rateLimitType?, resetsAt? } }`. Reset times are Unix seconds. This survives session
+persistence without changing content or stop reasons, allowing model fallback to
+recognize refusals without parsing error prose. Allowed/warning events, ordinary
+answers, and rejected nested windows alone do not add this diagnostic.
 
 The key is **`claude-rate-limit`** — deliberately neutral rather than
 namespaced to any one front-end, since it is account state any pi front-end
@@ -744,7 +749,7 @@ can use. The payload is JSON:
 
 ```jsonc
 {
-  "status": "allowed", // "rejected" once the window is capped
+  "status": "allowed", // top-level "rejected" means requests are refused
   "resetsAt": 1787368800, // unix seconds
   "rateLimitType": "five_hour",
   "overageStatus": "rejected",

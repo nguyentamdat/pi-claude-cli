@@ -209,6 +209,97 @@ describe("persistent CLI process", () => {
       expect(doneOf(1).message.stopReason).toBe("stop");
     });
 
+    it("marks rejected notices but never carries their limit state into a reused process's next turn", async () => {
+      process.env.PI_CLAUDE_CLI_CONTEXT = "pi";
+      const ctx = { messages: [{ role: "user", content: "first" }] };
+      streamViaCli(model, ctx, opts("limit-state") as any);
+      await vi.advanceTimersByTimeAsync(0);
+      const proc = procAt(0);
+      proc.stdout.write(
+        line({
+          type: "rate_limit_event",
+          rate_limit_info: { status: "rejected", rateLimitType: "five_hour" },
+        }) +
+          startCycle({ input_tokens: 1 }) +
+          text("You've hit your 5-hour limit · resets 5:10pm") +
+          endCycle("end_turn") +
+          result(),
+      );
+      await vi.advanceTimersByTimeAsync(10);
+      const first = doneOf(0).message;
+      expect(first.stopReason).toBe("stop");
+      expect(first.diagnostics?.[0]).toMatchObject({
+        type: "claude-limit",
+        details: { status: "rejected" },
+      });
+      streamViaCli(
+        model,
+        {
+          messages: [
+            ...ctx.messages,
+            first,
+            { role: "user", content: "second" },
+          ],
+        },
+        opts("limit-state") as any,
+      );
+      await vi.advanceTimersByTimeAsync(0);
+      expect(spawn).toHaveBeenCalledTimes(1);
+      proc.stdout.write(
+        result({
+          subtype: "error",
+          is_error: true,
+          error: "Unrelated failure",
+        }),
+      );
+      await vi.advanceTimersByTimeAsync(10);
+      const failure = MockStream.mock.instances[1]._events.find(
+        (event: any) => event.type === "error",
+      );
+      expect(failure.error.stopReason).toBe("error");
+      expect(failure.error.errorMessage).toBe("Unrelated failure");
+      expect(failure.error.diagnostics).toBeUndefined();
+    });
+
+    it("attaches a diagnostic to Pi-owned errors even without a textual limit match", async () => {
+      process.env.PI_CLAUDE_CLI_CONTEXT = "pi";
+      streamViaCli(
+        model,
+        { messages: [{ role: "user", content: "go" }] },
+        opts("limit-error") as any,
+      );
+      await vi.advanceTimersByTimeAsync(0);
+      procAt(0).stdout.write(
+        line({
+          type: "rate_limit_event",
+          rate_limit_info: {
+            status: "rejected",
+            rateLimitType: "seven_day",
+            resetsAt: 1787331600,
+          },
+        }) +
+          result({
+            subtype: "error",
+            is_error: true,
+            error: "Request refused",
+          }),
+      );
+      await vi.advanceTimersByTimeAsync(10);
+      const failure = MockStream.mock.instances[0]._events.find(
+        (event: any) => event.type === "error",
+      );
+      expect(failure.error.stopReason).toBe("error");
+      expect(failure.error.errorMessage).toBe("Request refused");
+      expect(failure.error.diagnostics?.[0]).toMatchObject({
+        type: "claude-limit",
+        details: {
+          status: "rejected",
+          rateLimitType: "seven_day",
+          resetsAt: 1787331600,
+        },
+      });
+    });
+
     it("reimports legacy history without a manual reset or resuming the old ledger", async () => {
       const ctx = {
         systemPrompt: "LEGACY",

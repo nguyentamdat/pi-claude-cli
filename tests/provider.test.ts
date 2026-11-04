@@ -297,6 +297,75 @@ describe("streamViaCli", () => {
     expect(mockStream.end).toHaveBeenCalled();
   });
 
+  it.each([
+    { statuses: ["rejected"], notice: false, marked: true },
+    { statuses: ["allowed", "rejected"], notice: false, marked: true },
+    { statuses: ["rejected", "allowed"], notice: false, marked: false },
+    { statuses: ["rejected", "allowed_warning"], notice: false, marked: false },
+    { statuses: [], notice: false, marked: false },
+    { statuses: ["rejected"], notice: true, marked: true },
+    { statuses: ["allowed_warning"], notice: true, marked: false },
+  ])(
+    "uses the latest turn limit state: $statuses, notice=$notice",
+    async ({ statuses, notice, marked }) => {
+      streamViaCli(
+        mockModels[0] as any,
+        { messages: [{ role: "user", content: "Hello" }] },
+        {
+          onRateLimit: () => {
+            throw new Error("status UI failed");
+          },
+        },
+      );
+      await vi.advanceTimersByTimeAsync(0);
+      const proc = (spawn as any).mock.results[0].value;
+      for (const status of statuses) {
+        proc.stdout.write(
+          JSON.stringify({
+            type: "rate_limit_event",
+            rate_limit_info: {
+              status,
+              rateLimitType: "five_hour",
+              resetsAt: 1787331600,
+            },
+          }) + "\n",
+        );
+      }
+      proc.stdout.write(
+        JSON.stringify(
+          notice
+            ? {
+                type: "result",
+                subtype: "success",
+                result: "You've hit your 5-hour limit · resets 5:10pm",
+              }
+            : { type: "result", subtype: "error", error: "Request refused" },
+        ) + "\n",
+      );
+      await vi.advanceTimersByTimeAsync(100);
+      const done =
+        MockAssistantMessageEventStream.mock.instances[0]._events.find(
+          (e: any) => e.type === "done",
+        );
+      expect(done.message.stopReason).toBe("stop");
+      if (marked) {
+        expect(done.message.diagnostics).toEqual([
+          {
+            type: "claude-limit",
+            timestamp: expect.any(Number),
+            details: {
+              status: "rejected",
+              rateLimitType: "five_hour",
+              resetsAt: 1787331600,
+            },
+          },
+        ]);
+      } else {
+        expect(done.message.diagnostics).toBeUndefined();
+      }
+    },
+  );
+
   it("calls cleanupProcess after receiving result", async () => {
     const model = mockModels[0] as any;
     const context = {

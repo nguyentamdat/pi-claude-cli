@@ -49,8 +49,10 @@ import {
 } from "./process-manager.js";
 import { createEventBridge } from "./event-bridge.js";
 import { isTaskSubtype } from "./task-tracker.js";
+import { appendClaudeLimitDiagnostic } from "./rate-limit.js";
 import type {
   ClaudeModelUsage,
+  ClaudeRateLimitEvent,
   ClaudeUsage,
   TaskTrackerState,
 } from "./types.js";
@@ -626,6 +628,7 @@ export function streamViaCli(
       const turnReportedBefore = live.turnReported;
       // Result deltas seen by THIS episode (a sub-agent wait yields several).
       let episodeResultTotals = ZERO_USAGE;
+      let latestRateLimitInfo: ClaudeRateLimitEvent["rate_limit_info"];
 
       // Guard against double stream.end() and double error events.
       let streamEnded = false;
@@ -663,6 +666,9 @@ export function streamViaCli(
             : [{ type: "text" as const, text: `Error: ${errMsg}` }],
           stopReason: "stop" as const,
         };
+        // Legacy mode reports failures as stops; retain that behavior.
+        if (!aborted)
+          appendClaudeLimitDiagnostic(errorMessage, latestRateLimitInfo, true);
         stream.push(
           piOwned
             ? ({
@@ -906,11 +912,10 @@ export function streamViaCli(
               return;
             }
           } else if (msg.type === "rate_limit_event") {
-            // Account-level state, not turn content: hand it to the host so a
-            // front-end can surface the window and its reset. Never touches
-            // the assistant message.
-            const info = (msg as any).rate_limit_info;
-            if (info && typeof info === "object") {
+            // Keep only this turn's latest state, also forwarding it to the host.
+            const info = msg.rate_limit_info;
+            if (info && typeof info === "object" && !Array.isArray(info)) {
+              latestRateLimitInfo = { ...info };
               try {
                 options?.onRateLimit?.(info);
               } catch {
@@ -1113,6 +1118,7 @@ export function streamViaCli(
             ? "stop"
             : output.stopReason;
 
+        if (!aborted) appendClaudeLimitDiagnostic(output, latestRateLimitInfo);
         if (piOwned) {
           const acknowledged = [...messages, output];
           live.piHistory = {

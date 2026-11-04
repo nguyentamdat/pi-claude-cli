@@ -1,3 +1,6 @@
+import type { AssistantMessage } from "@earendil-works/pi-ai";
+import type { ClaudeRateLimitEvent } from "./types.js";
+
 /**
  * Account rate-limit state, shaped for the host's status channel.
  *
@@ -61,4 +64,43 @@ export function buildRateLimitPayload(
 export function rateLimitIdentity(payload: RateLimitPayload): string {
   const { observedAt: _observedAt, ...rest } = payload;
   return JSON.stringify(rest);
+}
+
+// The CLI sometimes returns its quota notice as a successful assistant stop.
+const CLI_LIMIT_NOTICE =
+  /^(?:Error:\s*)?(?:you(?:'|’)ve|you have) (?:hit|reached) your (?:[\w-]+ )?limit(?:\s*[·—–\-:,.]|\s*$)/i;
+
+/** Persist a rejected request in Pi's native diagnostics, without changing turn semantics. */
+export function appendClaudeLimitDiagnostic(
+  message: AssistantMessage,
+  info: ClaudeRateLimitEvent["rate_limit_info"],
+  failed = message.stopReason === "error",
+): void {
+  // A rejected nested window/overage alone does not mean the request was refused.
+  if (info?.status !== "rejected") return;
+  if (!failed) {
+    if (
+      message.stopReason !== "stop" ||
+      message.content.some((part) => part.type !== "text")
+    )
+      return;
+    const text = message.content
+      .map((part) => (part.type === "text" ? part.text : ""))
+      .join("\n")
+      .trim();
+    if (text.length > 500 || !CLI_LIMIT_NOTICE.test(text)) return;
+  }
+  (message.diagnostics ??= []).push({
+    type: "claude-limit",
+    timestamp: Date.now(),
+    details: {
+      status: "rejected",
+      ...(typeof info.rateLimitType === "string"
+        ? { rateLimitType: info.rateLimitType }
+        : {}),
+      ...(typeof info.resetsAt === "number" && Number.isFinite(info.resetsAt)
+        ? { resetsAt: info.resetsAt }
+        : {}),
+    },
+  });
 }
