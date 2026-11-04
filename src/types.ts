@@ -76,6 +76,7 @@ export interface ClaudeRateLimitEvent {
   type: "rate_limit_event";
   rate_limit_info?: {
     status?: string;
+    /** Epoch seconds; pi-model-fallback relies on this unit. */
     resetsAt?: number;
     rateLimitType?: string;
     overageStatus?: string;
