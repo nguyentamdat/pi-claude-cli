@@ -60,6 +60,42 @@ describe("provider account files", () => {
       expect(claudeAccountsStatus()).not.toContain("symlink-secret");
     },
   );
+  it.skipIf(process.platform === "win32").each([
+    ["claude-1", false],
+    ["claude-1", true],
+    ["claude-2", false],
+    ["claude-2", true],
+  ] as const)(
+    "validates config-dir-only %s target mode and ownership (symlink: %s)",
+    (name, linked) => {
+      const target = linked
+        ? join(dir, "profile-account.json")
+        : accountFile(name);
+      const env = { CLAUDE_CONFIG_DIR: dir };
+      writeFileSync(target, JSON.stringify({ env }), { mode: 0o600 });
+      if (linked) symlinkSync(target, accountFile(name));
+      expect(readAccountEnv(name).env).toEqual(env);
+      for (const mode of [0o644, 0o640, 0o400, 0o1600]) {
+        chmodSync(target, mode);
+        expect(() => readAccountEnv(name)).toThrow("mode 0600");
+      }
+      chmodSync(target, 0o600);
+      if (typeof process.getuid === "function") {
+        const uid = process.getuid();
+        const getuid = vi
+          .spyOn(process as { getuid: () => number }, "getuid")
+          .mockReturnValue(uid + 1);
+        try {
+          expect(() => readAccountEnv(name)).toThrow(
+            "owned by the current user",
+          );
+        } finally {
+          getuid.mockRestore();
+        }
+      }
+      expect(readAccountEnv(name).env).toEqual(env);
+    },
+  );
   it.skipIf(typeof process.getuid !== "function")(
     "refuses token files owned by another user",
     () => {

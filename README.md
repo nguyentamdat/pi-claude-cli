@@ -28,7 +28,7 @@ Each provider reads its own `<agentDir>/claude-accounts/<name>.json`, where `age
 { "env": { "CLAUDE_CODE_OAUTH_TOKEN": "<your account token>" } }
 ```
 
-Alternatively use `{"env":{"CLAUDE_CONFIG_DIR":"/absolute/existing/profile"}}` for an already authenticated official CLI profile. These are the only allowed env keys; values must be nonempty strings, and the file must contain only the `env` object. Token files must be owned by the current user and have mode **0600** (`chmod 600`). Symlinked account files are supported: target permissions/ownership are checked. Dangling symlinks, invalid JSON and unsupported keys fail with secret-free errors.
+Alternatively use `{"env":{"CLAUDE_CONFIG_DIR":"/absolute/existing/profile"}}` for an already authenticated official CLI profile. These are the only allowed env keys; values must be nonempty strings, and the file must contain only the `env` object. All configured account files must be owned by the current user and have mode **0600** (`chmod 600`). Symlinked account files are supported: target permissions/ownership are checked. Dangling symlinks, invalid JSON and unsupported keys fail with secret-free errors.
 
 Missing `claude-1.json` uses native default login, with inherited `CLAUDE_CONFIG_DIR` and `CLAUDE_CODE_OAUTH_TOKEN` removed from the child env. Missing/invalid `claude-2.json` fails that provider's requests, never silently using account1. Explicit token files pass the token directly to the child CLI. Pi's `process.env` is never changed. Files are read at **spawn time**: edits apply to new CLI processes; an existing warm process retains its account. Pools are isolated per provider/account and reuse acknowledged history within an account.
 

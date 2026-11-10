@@ -125,6 +125,30 @@ describe.skipIf(process.platform === "win32")("Claude shell wrappers", () => {
       args: [],
     });
   });
+  it.each(["claude-1", "claude-2"])(
+    "refuses insecure config-dir-only symlink targets for wrapper %s",
+    (name) => {
+      expect(install().status).toBe(0);
+      const target = join(dir, "profile-account.json");
+      writeFileSync(
+        target,
+        JSON.stringify({ env: { CLAUDE_CONFIG_DIR: dir } }),
+        { mode: 0o600 },
+      );
+      symlinkSync(
+        target,
+        join(dir, "agent", "claude-accounts", `${name}.json`),
+      );
+      expect(run(name).status).toBe(0);
+      chmodSync(target, 0o644);
+      const refused = run(name);
+      expect(refused.status).toBe(1);
+      expect(refused.stderr).toContain("mode 0600");
+      expect(refused.stdout).toBe("");
+      chmodSync(target, 0o600);
+      expect(run(name).status).toBe(0);
+    },
+  );
   it("blocks conflicting inherited auth for configured wrappers without printing credentials", () => {
     expect(install().status).toBe(0);
     save({ env: { CLAUDE_CODE_OAUTH_TOKEN: "configured-secret" } });

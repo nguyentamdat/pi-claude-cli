@@ -79,14 +79,10 @@ export function readAccountEnv(name) {
     fail("env allows only CLAUDE_CODE_OAUTH_TOKEN or CLAUDE_CONFIG_DIR");
   if (keys.some((key) => typeof env[key] !== "string" || !env[key].trim()))
     fail("account env values must be nonempty strings");
-  if (env.CLAUDE_CODE_OAUTH_TOKEN && (stat.mode & 0o7777) !== 0o600)
-    fail("token account file must have mode 0600 (chmod 600)");
-  if (
-    env.CLAUDE_CODE_OAUTH_TOKEN &&
-    typeof process.getuid === "function" &&
-    stat.uid !== process.getuid()
-  )
-    fail("token account file must be owned by the current user");
+  if ((stat.mode & 0o7777) !== 0o600)
+    fail("account file must have mode 0600 (chmod 600)");
+  if (typeof process.getuid === "function" && stat.uid !== process.getuid())
+    fail("account file must be owned by the current user");
   if (env.CLAUDE_CONFIG_DIR) {
     try {
       if (
