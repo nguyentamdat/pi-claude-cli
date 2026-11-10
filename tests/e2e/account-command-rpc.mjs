@@ -22,9 +22,10 @@ const agent = join(work, "agent");
 const bin = join(work, "bin");
 const profile = join(work, "account2");
 for (const path of [agent, bin, profile]) mkdirSync(path, { mode: 0o700 });
+mkdirSync(join(agent, "claude-accounts"));
 writeFileSync(
-  join(agent, "claude-accounts.json"),
-  JSON.stringify({ account2: profile }),
+  join(agent, "claude-accounts", "claude-2.json"),
+  JSON.stringify({ env: { CLAUDE_CONFIG_DIR: profile } }),
 );
 // Even if dispatch regresses, this fixture cannot contact a model or read auth.
 writeFileSync(
@@ -40,6 +41,7 @@ chmodSync(join(bin, "claude"), 0o700);
 const env = {
   ...process.env,
   PI_CODING_AGENT_DIR: agent,
+  HOME: work,
   PI_OFFLINE: "1",
   PATH: `${bin}${process.platform === "win32" ? ";" : ":"}${process.env.PATH}`,
 };
@@ -102,6 +104,25 @@ function request(command) {
   });
 }
 try {
+  const available = await request({ type: "get_available_models" });
+  assert.equal(available.success, true, "model catalog available");
+  const idsFor = (provider) =>
+    available.data.models
+      .filter((model) => model.provider === provider)
+      .map((model) => model.id)
+      .sort();
+  const aliasIds = idsFor("pi-claude-cli");
+  assert.ok(aliasIds.length > 0, "compatibility alias models registered");
+  assert.deepEqual(
+    idsFor("claude-1"),
+    aliasIds,
+    "account1 model catalog matches alias",
+  );
+  assert.deepEqual(
+    idsFor("claude-2"),
+    aliasIds,
+    "account2 model catalog matches alias",
+  );
   const commands = await request({ type: "get_commands" });
   assert.equal(commands.success, true, "get_commands must succeed");
   assert.ok(
@@ -109,11 +130,10 @@ try {
     "manual command registered",
   );
   for (const [message, expected] of [
-    ["/claude-account status", "account1"],
-    ["/claude-account list", "account2:"],
-    ["/claude-account select account2", "Claude profile: account2"],
-    ["/claude-account status", "Claude profile: account2"],
-    ["/claude-account account1", "Claude profile: account1"],
+    ["/claude-account status", "claude-1: native default login"],
+    ["/claude-account list", "claude-2:"],
+    ["/claude-account select claude-2", "Read-only command"],
+    ["/claude-account status", "pi-claude-cli: alias of claude-1"],
   ]) {
     const start = notifications.length;
     const response = await request({ type: "prompt", message });
@@ -130,7 +150,7 @@ try {
     "commands must never become model conversation",
   );
   console.log(
-    "account-command RPC OK: list/status/select/account1; no model requests or auth writes",
+    "account-command RPC OK: read-only list/status; no model requests or auth writes",
   );
 } catch (error) {
   // Never relay full CLI output/config; only report the test's own assertions.

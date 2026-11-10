@@ -6,7 +6,7 @@
 pi install npm:@saccolabs/pi-claude-cli
 ```
 
-Pick a model under `pi-claude-cli` with `/model`. The same default works in pi's terminal and [Phosphor](https://github.com/agustinsacco/Phosphor). No separate minimal mode or configuration is required.
+Pick a model under `claude-1` (or the compatible `pi-claude-cli` alias) with `/model`. The same default works in pi's terminal and [Phosphor](https://github.com/agustinsacco/Phosphor). No separate minimal mode or configuration is required.
 
 Requires Node 22+, pi, and an authenticated `claude` binary on PATH (Claude Code 2.1.263+). Tested with pi 0.87.1 and Claude Code 2.1.280. Subscription credentials stay in the official CLI; no API key extraction.
 
@@ -18,32 +18,31 @@ Requires Node 22+, pi, and an authenticated `claude` binary on PATH (Claude Code
 - **Storage:** default Claude processes use `--no-session-persistence`. No new Claude conversation file, resume pairing or saved system-prompt sidecar is created. Private temporary prompt and MCP files are removed when no longer needed; the runtime directory is removed on process exit. A SIGKILL can leave its private temporary directory behind.
 - **Compaction:** pi compacts its own history normally. CLI auto-compaction is disabled. Hosts must not switch off pi compaction just because this provider is selected.
 
-## Manual Claude account switching
+## Claude accounts: one provider per account
 
-`/claude-account status` shows the selected **profile alias and directory only**, not an authenticated identity. `/claude-account list` lists configured aliases. Start on `account1`, the official CLI's existing default (including an inherited `CLAUDE_CONFIG_DIR`, if set). Nothing switches automatically on quota errors.
+Choose `claude-1/<model-id>` or `claude-2/<model-id>` with `/model`. Both expose the same static Anthropic model catalog. `pi-claude-cli/<model-id>` remains an alias of `claude-1` for existing settings, fallback chains and host model choices.
 
-Create `~/.pi/agent/claude-accounts.json` (or `$PI_CODING_AGENT_DIR/claude-accounts.json`, overridable with `PI_CLAUDE_CLI_ACCOUNTS_FILE`) containing only aliases and absolute paths to **already authenticated official CLI profiles**:
+Each provider reads its own `<agentDir>/claude-accounts/<name>.json`, where `agentDir` is nonempty `$PI_CODING_AGENT_DIR` or `~/.pi/agent`, and `name` is `claude-1` or `claude-2`:
 
 ```json
-{
-  "account2": "/absolute/path/to/your/second/claude-profile"
-}
+{ "env": { "CLAUDE_CODE_OAUTH_TOKEN": "<your account token>" } }
 ```
 
-Then, while Pi is idle:
+Alternatively use `{"env":{"CLAUDE_CONFIG_DIR":"/absolute/existing/profile"}}` for an already authenticated official CLI profile. These are the only allowed env keys; values must be nonempty strings, and the file must contain only the `env` object. Token files must be owned by the current user and have mode **0600** (`chmod 600`). Symlinked account files are supported: target permissions/ownership are checked. Dangling symlinks, invalid JSON and unsupported keys fail with secret-free errors.
 
-```text
-/claude-account select account2
-/claude-account account1
-```
+Missing `claude-1.json` uses native default login, with inherited `CLAUDE_CONFIG_DIR` and `CLAUDE_CODE_OAUTH_TOKEN` removed from the child env. Missing/invalid `claude-2.json` fails that provider's requests, never silently using account1. Explicit token files pass the token directly to the child CLI. Pi's `process.env` is never changed. Files are read at **spawn time**: edits apply to new CLI processes; an existing warm process retains its account. Pools are isolated per provider/account and reuse acknowledged history within an account.
 
-The short form `/claude-account account2` also selects it. `account1` is reserved; do not put it in the map. No login, logout, token entry, credential copy or global authentication/settings write is performed. The official CLI continues to manage its own authentication normally. This command is supported by Pi's TUI and native RPC `prompt` dispatch (`get_commands` lists it); an external host must forward the slash text unchanged with command expansion enabled. Hosts that send it only as conversation text cannot switch accounts. HSA-specific forwarding is not verified here.
+Configured files fail closed if conflicting inherited API-key/auth-token overrides, OAuth/API-key file descriptors, alternate-cloud flags or `CLAUDE_SECURESTORAGE_CONFIG_DIR` are set. Errors name only those variables, never their values; unset them before using a configured account. Missing-file `claude-1` keeps its native login behavior.
 
-Selection is in memory for this extension runtime/session only. `/reload`, `/new`, `/resume`, forks and separately spawned Pi subagents start at `account1`; selection does not propagate through the parent's environment. Nested requests using the **same in-process provider registration** inherit its current selection, captured at request start. Other running Pi processes, the dashboard and global settings are unaffected. This feature requires the default pi context policy, not `legacy`.
+`/claude-account` (also `status` or `list`) is **read-only**: it lists provider sources, whether a token is present, and config directories, never token values or authenticated identities. The old session-local selection command and `claude-accounts.json` map are no longer used. Select accounts through `/model` instead.
 
-Busy switches are rejected (generation, retry, tool execution or parked handoff); finish or cancel the run and retry. A successful switch retires old warm processes, clears this provider's rate-limit/subagent status, and reimports Pi's history on the next request. Warm signatures include profile identity; the child alone receives `CLAUDE_CONFIG_DIR`, so returning to `account1` restores its original unset/explicit default without a `process.env` race. Token/API-key/keychain-location or alternate-cloud environment overrides block switching with variable **names only** in the warning; they are never deleted or overwritten.
+**Manual-default contamination:** native `claude-1` can follow `CLAUDE_CODE_OAUTH_TOKEN` in `~/.claude/settings.json` (or the selected profile's `settings.json`), for example after an external host's manual-default switch. Status reports **“claude-1 follows manual default token from settings.json”** without exposing the token. This provider never modifies settings.json. To pin account1 independently of that manual default, configure its own token file. Host/managed guards and official CLI authentication remain in force.
 
-The model catalog remains Pi's static Anthropic catalog, not a profile-specific entitlement check. Provider rate-limit events and rejection diagnostics carry the profile alias; each request starts without the previous account's rejection state. Independent host quota monitors (such as shared `/quota` snapshots) may still read the default account: do not treat them as the selected profile's quota. A host's existing cross-provider fallback/restore policy is not changed: if it switched away from Claude, cancel its pending restore with `/model-fallback stay` when available and explicitly choose a `pi-claude-cli` model. This command never auto-selects a model or retries inference.
+Quota notices and rejected rate-limit diagnostics become assistant errors with `stopReason: "error"` and `errorMessage` containing `rate limit`, retaining the provider id and diagnostics. This is the provider-independent signal recognized by `pi-model-fallback`; configure that extension's chain as `claude-1/<model-id>` → `claude-2/<model-id>` → `openai-codex/<model-id>`. The provider itself does not switch models or retry across accounts. Independent host `/quota` monitors may still describe the native account rather than the selected provider.
+
+### Optional terminal wrappers
+
+Run `node scripts/install-claude-wrappers.mjs --dry-run` to preview, then without `--dry-run` to install `claude-1` and `claude-2` shell wrappers. Use `--bin-dir /your/bin` to override `~/.local/bin`. Existing targets are refused, not overwritten. No account file is read at installation and no token is embedded. Each invocation reads and validates the same account files (including symlink targets), sets child-only credentials, and execs the absolute real `claude` resolved from PATH at installation. Keep this package installed at its current location; reinstall wrappers if its location or the real CLI path changes. These wrappers are for POSIX shells, not Windows command prompts.
 
 ## Switching providers
 

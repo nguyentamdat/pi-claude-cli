@@ -92,7 +92,7 @@ describe("provider registration (default export)", () => {
     const mod = await import("../index");
     mod.default(mockPi);
 
-    expect(registerProvider).toHaveBeenCalledTimes(1);
+    expect(registerProvider).toHaveBeenCalledTimes(3);
     expect(registerProvider.mock.calls[0][0]).toBe("pi-claude-cli");
   });
 
@@ -301,11 +301,11 @@ describe("streamViaCli", () => {
     await vi.advanceTimersByTimeAsync(100);
 
     const mockStream = MockAssistantMessageEventStream.mock.instances[0];
-    const doneEvent = mockStream._events.find(
-      (e: any) => e.type === "done" && e.message,
-    );
-    expect(doneEvent).toBeDefined();
-    expect(doneEvent.message.content).toBeDefined();
+    const errorEvent = mockStream._events.find((e: any) => e.type === "error");
+    expect(errorEvent).toBeDefined();
+    expect(errorEvent.error.stopReason).toBe("error");
+    expect(errorEvent.error.errorMessage).toContain("rate limit");
+    expect(errorEvent.error.content).toBeDefined();
     expect(mockStream.end).toHaveBeenCalled();
   });
 
@@ -355,13 +355,14 @@ describe("streamViaCli", () => {
         ) + "\n",
       );
       await vi.advanceTimersByTimeAsync(100);
-      const done =
+      const event =
         MockAssistantMessageEventStream.mock.instances[0]._events.find(
-          (e: any) => e.type === "done",
+          (e: any) => e.type === "done" || e.type === "error",
         );
-      expect(done.message.stopReason).toBe("stop");
+      const output = event.message ?? event.error;
+      expect(output.stopReason).toBe(marked || notice ? "error" : "stop");
       if (marked) {
-        expect(done.message.diagnostics).toEqual([
+        expect(output.diagnostics).toEqual([
           {
             type: "claude-limit",
             timestamp: expect.any(Number),
@@ -373,7 +374,7 @@ describe("streamViaCli", () => {
           },
         ]);
       } else {
-        expect(done.message.diagnostics).toBeUndefined();
+        expect(output.diagnostics).toBeUndefined();
       }
     },
   );

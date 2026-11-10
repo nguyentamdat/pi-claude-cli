@@ -15,6 +15,15 @@
  */
 import { beforeEach } from "vitest";
 
+import { afterAll } from "vitest";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+
+// Never read a developer's real provider-account files in deterministic tests.
+const accountTestDir = mkdtempSync(join(tmpdir(), "pcc-test-accounts-"));
+process.env.PI_CODING_AGENT_DIR = accountTestDir;
+afterAll(() => rmSync(accountTestDir, { recursive: true, force: true }));
 // Existing observer-mode fixtures exercise the explicitly supported legacy path.
 // Pi-owned suites unset this in their own beforeEach to test the real default.
 beforeEach(() => {

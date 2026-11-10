@@ -1,123 +1,166 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
+  symlinkSync,
+  chmodSync,
   mkdirSync,
   mkdtempSync,
-  readFileSync,
   rmSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import {
-  ClaudeAccounts,
-  accountOverrideNames,
-  claudeAccountIdentity,
-} from "../src/claude-accounts";
+import { accountFile, readAccountEnv } from "../src/claude-account-env.mjs";
+import { claudeAccountsStatus } from "../src/claude-accounts.js";
 
 let dir: string;
-let map: string;
-let profile: string;
 beforeEach(() => {
   dir = mkdtempSync(join(tmpdir(), "claude-accounts-"));
-  profile = join(dir, "second");
-  mkdirSync(profile, { mode: 0o700 });
-  map = join(dir, "profiles.json");
-  writeFileSync(map, JSON.stringify({ account2: profile }));
-  vi.stubEnv("PI_CLAUDE_CLI_ACCOUNTS_FILE", map);
-  vi.stubEnv("CLAUDE_CONFIG_DIR", undefined);
-  for (const name of accountOverrideNames()) vi.stubEnv(name, undefined);
+  mkdirSync(join(dir, "claude-accounts"));
+  vi.stubEnv("PI_CODING_AGENT_DIR", dir);
+  vi.stubEnv("HOME", dir);
 });
 afterEach(() => {
   vi.unstubAllEnvs();
   rmSync(dir, { recursive: true, force: true });
 });
+function save(value: unknown, name: "claude-1" | "claude-2" = "claude-2") {
+  writeFileSync(accountFile(name), JSON.stringify(value), { mode: 0o600 });
+}
 
-describe("ClaudeAccounts session-local selection", () => {
-  it("starts on the existing CLI default and never changes another runtime or the environment", () => {
-    const one = new ClaudeAccounts();
-    const other = new ClaudeAccounts();
-    expect(one.current()).toEqual({ alias: "account1", configDir: undefined });
-    expect(one.list()).toContain(`account2: ${profile}`);
-    const before = { ...process.env };
-    expect(one.select("account2", true)).toBe(true);
-    expect(one.current()).toEqual({ alias: "account2", configDir: profile });
-    expect(other.current().alias).toBe("account1");
-    expect(process.env).toEqual(before);
-    expect(one.select("account2", true)).toBe(false);
-    expect(one.select("account1", true)).toBe(true);
-    expect(one.current().configDir).toBeUndefined();
-    one.select("account2", true);
-    one.reset();
-    expect(one.current().alias).toBe("account1");
-  });
-
-  it("preserves an explicit default and never reads or mutates account credentials", () => {
-    const original = join(dir, "original");
-    mkdirSync(original);
-    const credential = join(original, ".credentials.json");
-    writeFileSync(credential, "sentinel-not-a-real-credential");
-    vi.stubEnv("CLAUDE_CONFIG_DIR", original);
-    const accounts = new ClaudeAccounts();
-    accounts.select("account2", true);
-    accounts.select("account1", true);
-    expect(accounts.current().configDir).toBe(original);
-    expect(readFileSync(credential, "utf8")).toBe(
-      "sentinel-not-a-real-credential",
+describe("provider account files", () => {
+  it("uses native login only for missing claude-1; missing claude-2 fails closed", () => {
+    expect(readAccountEnv("claude-1").env).toEqual({});
+    expect(() => readAccountEnv("claude-2")).toThrow(
+      "claude-2: account file missing",
     );
-    expect(accounts.status()).not.toContain("sentinel");
+    expect(claudeAccountsStatus()).toContain(
+      "pi-claude-cli: alias of claude-1",
+    );
   });
 
-  it("rejects busy, unknown, inaccessible and invalid selections without changing the account", () => {
-    const accounts = new ClaudeAccounts();
-    expect(() => accounts.select("account2", false)).toThrow("idle");
-    for (const alias of ["absent", "toString", "__proto__"])
-      expect(() => accounts.select(alias, true)).toThrow("Unknown");
-    writeFileSync(map, JSON.stringify({ account2: join(dir, "missing") }));
-    expect(() => accounts.select("account2", true)).toThrow("unavailable");
-    for (const value of [
-      "invalid-sentinel",
-      "[]",
-      '{"account1":"/override"}',
-      '{"account2":"relative"}',
-      '{"account2":42}',
-    ]) {
-      writeFileSync(map, value);
-      expect(() => accounts.list()).toThrow("Invalid Claude profile map");
-    }
-    expect(accounts.current().alias).toBe("account1");
-    rmSync(map);
-    expect(accounts.list()).toContain("account1");
-  });
-
-  it.each([
-    "ANTHROPIC_API_KEY",
-    "ANTHROPIC_AUTH_TOKEN",
-    "CLAUDE_CODE_OAUTH_TOKEN",
-    "CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR",
-    "ANTHROPIC_API_KEY_FILE_DESCRIPTOR",
-    "CLAUDE_SECURESTORAGE_CONFIG_DIR",
-    "CLAUDE_CODE_USE_VERTEX",
-    "CLAUDE_CODE_USE_BEDROCK",
-    "CLAUDE_CODE_USE_FOUNDRY",
-  ])(
-    "rejects %s overrides but never logs their values or changes them",
-    (name) => {
-      vi.stubEnv(name, "secret-sentinel");
-      const accounts = new ClaudeAccounts();
-      expect(() => accounts.select("account2", true)).toThrow(name);
-      expect(accounts.status()).toContain(name);
-      expect(accounts.status()).not.toContain("secret-sentinel");
-      expect(process.env[name]).toBe("secret-sentinel");
-      expect(accounts.current().alias).toBe("account1");
+  it.skipIf(process.platform === "win32")(
+    "follows symlinks and validates target mode; dangling claude-1 links never fall back",
+    () => {
+      const target = join(dir, "dashboard-account.json");
+      writeFileSync(
+        target,
+        JSON.stringify({ env: { CLAUDE_CODE_OAUTH_TOKEN: "symlink-secret" } }),
+        { mode: 0o600 },
+      );
+      symlinkSync(target, accountFile("claude-2"));
+      expect(readAccountEnv("claude-2").env.CLAUDE_CODE_OAUTH_TOKEN).toBe(
+        "symlink-secret",
+      );
+      chmodSync(target, 0o644);
+      expect(() => readAccountEnv("claude-2")).toThrow("mode 0600");
+      symlinkSync(join(dir, "missing-target"), accountFile("claude-1"));
+      expect(() => readAccountEnv("claude-1")).toThrow(
+        "symlink target missing",
+      );
+      expect(claudeAccountsStatus()).not.toContain("symlink-secret");
     },
   );
-
-  it("keys warm reuse by profile path even for the same alias", () => {
-    expect(
-      claudeAccountIdentity({ alias: "account2", configDir: "/a" }),
-    ).not.toBe(claudeAccountIdentity({ alias: "account2", configDir: "/b" }));
-    expect(claudeAccountIdentity({ alias: "account1" })).not.toBe(
-      claudeAccountIdentity({ alias: "account2", configDir: "/b" }),
+  it.skipIf(typeof process.getuid !== "function")(
+    "refuses token files owned by another user",
+    () => {
+      save({ env: { CLAUDE_CODE_OAUTH_TOKEN: "owner-secret" } });
+      const uid = process.getuid!();
+      const getuid = vi
+        .spyOn(process as { getuid: () => number }, "getuid")
+        .mockReturnValue(uid + 1);
+      try {
+        expect(() => readAccountEnv("claude-2")).toThrow(
+          "owned by the current user",
+        );
+        expect(claudeAccountsStatus()).not.toContain("owner-secret");
+      } finally {
+        getuid.mockRestore();
+      }
+    },
+  );
+  it("treats empty agent dir as unset", () => {
+    vi.stubEnv("PI_CODING_AGENT_DIR", "");
+    expect(accountFile("claude-1")).toBe(
+      join(dir, ".pi", "agent", "claude-accounts", "claude-1.json"),
     );
+  });
+  it.each(["claude-1", "claude-2"] as const)(
+    "fails closed on conflicting inherited auth for configured %s, with names only",
+    (name) => {
+      save({ env: { CLAUDE_CODE_OAUTH_TOKEN: "file-secret" } }, name);
+      vi.stubEnv("ANTHROPIC_API_KEY", "inherited-api-secret");
+      expect(() => readAccountEnv(name)).toThrow("ANTHROPIC_API_KEY");
+      expect(claudeAccountsStatus()).not.toMatch(
+        /file-secret|inherited-api-secret/,
+      );
+      if (name === "claude-2")
+        expect(readAccountEnv("claude-1").env).toEqual({});
+    },
+  );
+  it("accepts a private token and never includes it in status", () => {
+    save({ env: { CLAUDE_CODE_OAUTH_TOKEN: "secret-sentinel" } });
+    expect(readAccountEnv("claude-2").env.CLAUDE_CODE_OAUTH_TOKEN).toBe(
+      "secret-sentinel",
+    );
+    expect(claudeAccountsStatus()).toContain("token present: yes");
+    expect(claudeAccountsStatus()).not.toContain("secret-sentinel");
+  });
+  it.skipIf(process.platform === "win32")(
+    "requires exactly 0600 for token files, without exposing credentials",
+    () => {
+      save({ env: { CLAUDE_CODE_OAUTH_TOKEN: "secret-sentinel" } });
+      for (const mode of [0o644, 0o640, 0o400, 0o1600]) {
+        chmodSync(accountFile("claude-2"), mode);
+        expect(() => readAccountEnv("claude-2")).toThrow("mode 0600");
+        expect(claudeAccountsStatus()).not.toContain("secret-sentinel");
+      }
+    },
+  );
+  it.each([
+    {},
+    { env: {} },
+    { env: [] },
+    { env: { OTHER_SECRET: "secret-sentinel" } },
+    { env: { CLAUDE_CODE_OAUTH_TOKEN: 123 } },
+    { env: { CLAUDE_CODE_OAUTH_TOKEN: " " } },
+    { env: { CLAUDE_CONFIG_DIR: "relative" } },
+    { env: { CLAUDE_CONFIG_DIR: "/nonexistent/secret-sentinel" } },
+    { env: { CLAUDE_CODE_OAUTH_TOKEN: "secret-sentinel" }, extra: true },
+  ])("rejects invalid config without echoing values: %#", (config) => {
+    save(config);
+    expect(() => readAccountEnv("claude-2")).toThrow("claude-2:");
+    expect(claudeAccountsStatus()).not.toContain("secret-sentinel");
+  });
+  it("rejects malformed JSON and invalid claude-1 instead of silently using native", () => {
+    writeFileSync(accountFile("claude-1"), "{secret-sentinel");
+    expect(() => readAccountEnv("claude-1")).toThrow("invalid account JSON");
+    expect(claudeAccountsStatus()).not.toContain("secret-sentinel");
+  });
+  it("accepts an absolute existing directory and reports a settings token without reading out its value", () => {
+    const profile = join(dir, "profile");
+    mkdirSync(profile);
+    writeFileSync(
+      join(profile, "settings.json"),
+      JSON.stringify({ env: { CLAUDE_CODE_OAUTH_TOKEN: "manual-secret" } }),
+    );
+    save({ env: { CLAUDE_CONFIG_DIR: profile } }, "claude-1");
+    expect(readAccountEnv("claude-1").env.CLAUDE_CONFIG_DIR).toBe(profile);
+    expect(claudeAccountsStatus()).toContain(
+      "claude-1 follows manual default token from settings.json",
+    );
+    expect(claudeAccountsStatus()).not.toContain("manual-secret");
+  });
+  it("warns about a native manual-default settings token, but explicit token accounts take precedence", () => {
+    mkdirSync(join(dir, ".claude"));
+    writeFileSync(
+      join(dir, ".claude", "settings.json"),
+      JSON.stringify({ env: { CLAUDE_CODE_OAUTH_TOKEN: "manual-secret" } }),
+    );
+    expect(claudeAccountsStatus()).toContain(
+      "claude-1 follows manual default token from settings.json",
+    );
+    save({ env: { CLAUDE_CODE_OAUTH_TOKEN: "explicit-secret" } }, "claude-1");
+    expect(claudeAccountsStatus()).not.toContain("follows manual default");
+    expect(claudeAccountsStatus()).not.toMatch(/manual-secret|explicit-secret/);
   });
 });

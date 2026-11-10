@@ -66,6 +66,7 @@
   "files": [
     "index.ts",
     "src/",
+    "scripts/install-claude-wrappers.mjs",
     "README.md",
     "LICENSE"
   ]

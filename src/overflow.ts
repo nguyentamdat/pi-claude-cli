@@ -48,7 +48,11 @@ export function rewriteOverflowMessage(
 ): { message: Record<string, unknown> } | undefined {
   if (message.role !== "assistant") return undefined;
   if (message.stopReason !== "error") return undefined;
-  if (message.provider !== "pi-claude-cli" && ctxProvider !== "pi-claude-cli")
+  const providers = ["pi-claude-cli", "claude-1", "claude-2"];
+  if (
+    !providers.includes(message.provider ?? "") &&
+    !providers.includes(ctxProvider ?? "")
+  )
     return undefined;
 
   const errorMessage = message.errorMessage ?? "";

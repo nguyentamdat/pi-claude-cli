@@ -2,6 +2,7 @@ import { describe, it, expect } from "vitest";
 import type { AssistantMessage } from "@earendil-works/pi-ai";
 import {
   appendClaudeLimitDiagnostic,
+  normalizeClaudeLimitFailure,
   buildRateLimitPayload,
   rateLimitIdentity,
 } from "../src/rate-limit";
@@ -211,6 +212,44 @@ describe("appendClaudeLimitDiagnostic", () => {
       true,
     );
     expect(output.diagnostics?.[0].details).toEqual({ status: "rejected" });
+    expect(output.stopReason).toBe("stop");
+  });
+  it.each(["claude-1", "claude-2", "pi-claude-cli"])(
+    "normalizes %s quota notices and diagnostic-only rejection",
+    (provider) => {
+      for (const notice of [true, false]) {
+        const output = message(
+          "stop",
+          notice
+            ? "You've hit your 5-hour limit · resets tomorrow"
+            : "Request refused",
+        );
+        output.provider = provider;
+        if (!notice)
+          appendClaudeLimitDiagnostic(
+            output,
+            { status: "rejected" },
+            true,
+            provider,
+          );
+        expect(normalizeClaudeLimitFailure(output)).toBe(true);
+        expect(output.provider).toBe(provider);
+        // pi-model-fallback limitFailure's provider-independent error branch.
+        expect(output.stopReason).toBe("error");
+        expect(output.errorMessage).toMatch(
+          /rate[ _-]?limit|too many requests|\b429\b/i,
+        );
+      }
+    },
+  );
+  it.each([
+    "You've hit your context limit",
+    "You've hit your token limit",
+    "You've hit your output limit",
+    "Task completed",
+  ])("does not misclassify %s", (text) => {
+    const output = message("stop", text);
+    expect(normalizeClaudeLimitFailure(output)).toBe(false);
     expect(output.stopReason).toBe("stop");
   });
 });

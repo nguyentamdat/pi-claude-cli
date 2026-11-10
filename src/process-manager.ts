@@ -24,9 +24,10 @@ import {
 import { envFlag, isEphemeral } from "./env-flag.js";
 import { thinkingSpawnArgs, type CliThinking } from "./thinking-config.js";
 import {
-  assertAccountEnvironment,
+  claudeAccountForProvider,
   type ClaudeAccount,
 } from "./claude-accounts.js";
+import { readAccountEnv } from "./claude-account-env.mjs";
 
 /**
  * Spawn a Claude CLI subprocess with all required flags for stream-json communication.
@@ -84,7 +85,9 @@ export function spawnClaude(
     systemPromptMode?: SystemPromptMode;
   },
 ): ChildProcess {
-  if (options?.account) assertAccountEnvironment(options.account);
+  const accountEnv = readAccountEnv(
+    (options?.account ?? claudeAccountForProvider()).alias,
+  ).env;
   const piContext = usesPiContext();
   if (piContext) {
     assertContextCliVersion(
@@ -239,10 +242,9 @@ export function spawnClaude(
   // hour before it gives up on a call. Config, not context: it never touches
   // the prompt cache.
   const env = { ...process.env };
-  if (options?.account) {
-    if (options.account.configDir === undefined) delete env.CLAUDE_CONFIG_DIR;
-    else env.CLAUDE_CONFIG_DIR = options.account.configDir;
-  }
+  delete env.CLAUDE_CONFIG_DIR;
+  delete env.CLAUDE_CODE_OAUTH_TOKEN;
+  Object.assign(env, accountEnv);
   if (piContext) {
     // Do not use --bare: it disables subscription OAuth/keychain reads.
     // Empty setting sources drop user/project/local hooks, but explicit

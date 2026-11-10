@@ -9,7 +9,7 @@ export default defineConfig({
     coverage: {
       provider: "v8",
       reporter: ["text", "json-summary"],
-      include: ["src/**/*.ts", "index.ts"],
+      include: ["src/**/*.ts", "src/**/*.mjs", "index.ts"],
       exclude: ["src/mcp-schema-server.cjs"],
       thresholds: {
         lines: 92,

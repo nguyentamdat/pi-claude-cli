@@ -7,7 +7,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { EventEmitter } from "node:events";
 import { PassThrough } from "node:stream";
 import { cliRequestsActive } from "../src/provider";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -170,6 +170,66 @@ describe("persistent CLI process", () => {
   });
 
   describe("pi context continuity", () => {
+    it.each(["claude-1", "claude-2", "pi-claude-cli"])(
+      "returns a provider-scoped fallback error for %s",
+      async (provider) => {
+        delete process.env.PI_CLAUDE_CLI_CONTEXT;
+        const original = process.env.PI_CODING_AGENT_DIR;
+        process.env.PI_CODING_AGENT_DIR = stateDir;
+        mkdirSync(join(stateDir, "claude-accounts"));
+        writeFileSync(
+          join(stateDir, "claude-accounts", "claude-2.json"),
+          JSON.stringify({
+            env: { CLAUDE_CODE_OAUTH_TOKEN: "limit-test-secret" },
+          }),
+          { mode: 0o600 },
+        );
+        try {
+          streamViaCli(
+            { ...model, provider },
+            { messages: [{ role: "user", content: "go" }] },
+            opts("provider-limit", {
+              account: {
+                alias: provider === "claude-2" ? "claude-2" : "claude-1",
+              },
+            }) as any,
+          );
+          await vi.advanceTimersByTimeAsync(0);
+          procAt(0).stdout.write(
+            startCycle({}) +
+              text("You've hit your weekly limit · resets tomorrow") +
+              endCycle("end_turn") +
+              result(),
+          );
+          await vi.advanceTimersByTimeAsync(10);
+          const failure = MockStream.mock.instances[0]._events.find(
+            (event: any) => event.type === "error",
+          ).error;
+          expect(failure.provider).toBe(provider);
+          expect(failure.stopReason).toBe("error");
+          expect(failure.errorMessage).toContain("rate limit");
+          expect(JSON.stringify(failure)).not.toContain("limit-test-secret");
+        } finally {
+          process.env.PI_CODING_AGENT_DIR = original;
+        }
+      },
+    );
+    it("returns a structured error for an unconfigured claude-2 without starting a CLI", async () => {
+      delete process.env.PI_CLAUDE_CLI_CONTEXT;
+      streamViaCli(
+        { ...model, provider: "claude-2" },
+        { messages: [] },
+        opts("missing-account", { account: { alias: "claude-2" } }) as any,
+      );
+      await vi.advanceTimersByTimeAsync(0);
+      const failure = MockStream.mock.instances[0]._events.find(
+        (event: any) => event.type === "error",
+      ).error;
+      expect(failure.provider).toBe("claude-2");
+      expect(failure.stopReason).toBe("error");
+      expect(failure.errorMessage).toContain("claude-2: account file missing");
+      expect(spawn).not.toHaveBeenCalled();
+    });
     it("keeps the aligned prompt and warm process across follow-up turns", async () => {
       process.env.PI_CLAUDE_CLI_CONTEXT = "pi";
       const ctx = {
@@ -211,61 +271,84 @@ describe("persistent CLI process", () => {
       expect(doneOf(1).message.stopReason).toBe("stop");
     });
 
-    it("retires a warm process on profile identity changes and scopes only the child's environment", async () => {
+    it("keeps pools separate per provider/account and reuses warm processes within each account", async () => {
       delete process.env.PI_CLAUDE_CLI_CONTEXT;
-      const inherited = process.env.CLAUDE_CONFIG_DIR;
+      const originalAgentDir = process.env.PI_CODING_AGENT_DIR;
+      process.env.PI_CODING_AGENT_DIR = stateDir;
+      mkdirSync(join(stateDir, "claude-accounts"));
+      const accountFile = join(stateDir, "claude-accounts", "claude-2.json");
+      writeFileSync(
+        accountFile,
+        JSON.stringify({ env: { CLAUDE_CODE_OAUTH_TOKEN: "pool-token" } }),
+        { mode: 0o600 },
+      );
       const ctx = { messages: [{ role: "user", content: "first" }] };
-      streamViaCli(
-        model,
-        ctx,
-        opts("profile-switch", {
-          account: { alias: "account1", configDir: inherited },
-        }) as any,
-      );
-      expect(cliRequestsActive()).toBe(true);
-      await vi.advanceTimersByTimeAsync(0);
-      const first = procAt(0);
-      first.stdout.write(
-        startCycle({ input_tokens: 1 }) +
-          text("one") +
-          endCycle("end_turn") +
-          result(),
-      );
-      await vi.advanceTimersByTimeAsync(10);
-      expect(cliRequestsActive()).toBe(false);
-      expect(parkedCliProcessesBusy()).toBe(false);
-      streamViaCli(
-        model,
-        {
-          messages: [
-            ...ctx.messages,
-            ourAssistant(doneOf(0).message.content),
-            { role: "user", content: "next" },
-          ],
-        },
-        opts("profile-switch", {
-          account: { alias: "account2", configDir: "/isolated/profile" },
-        }) as any,
-      );
-      await vi.advanceTimersByTimeAsync(600);
-      expect(first.stdin.end).toHaveBeenCalled();
-      expect(spawn).toHaveBeenCalledTimes(2);
-      expect((spawn as any).mock.calls[1][2].env.CLAUDE_CONFIG_DIR).toBe(
-        "/isolated/profile",
-      );
-      expect(process.env.CLAUDE_CONFIG_DIR).toBe(inherited);
-      const second = procAt(1);
-      second.stdout.write(
-        startCycle({ input_tokens: 1 }) +
-          text("two") +
-          endCycle("end_turn") +
-          result(),
-      );
-      await vi.advanceTimersByTimeAsync(10);
-      expect(doneOf(1).message.stopReason).toBe("stop");
+      try {
+        const firstModel = { ...model, provider: "claude-1" };
+        const secondModel = { ...model, provider: "claude-2" };
+        streamViaCli(
+          firstModel,
+          ctx,
+          opts("accounts", { account: { alias: "claude-1" } }) as any,
+        );
+        await vi.advanceTimersByTimeAsync(0);
+        const first = procAt(0);
+        first.stdout.write(
+          startCycle({}) + text("one") + endCycle("end_turn") + result(),
+        );
+        await vi.advanceTimersByTimeAsync(10);
+        streamViaCli(
+          secondModel,
+          ctx,
+          opts("accounts", { account: { alias: "claude-2" } }) as any,
+        );
+        await vi.advanceTimersByTimeAsync(0);
+        const second = procAt(1);
+        second.stdout.write(
+          startCycle({}) + text("two") + endCycle("end_turn") + result(),
+        );
+        await vi.advanceTimersByTimeAsync(10);
+        expect(first.stdin.end).not.toHaveBeenCalled();
+        expect(second.stdin.end).not.toHaveBeenCalled();
+        expect(
+          (spawn as any).mock.calls[1][2].env.CLAUDE_CODE_OAUTH_TOKEN,
+        ).toBe("pool-token");
+        // Rotating a file affects only new spawns, not the acknowledged warm process.
+        writeFileSync(accountFile, "invalid JSON");
+        for (const [index, accountModel, alias, answer] of [
+          [0, firstModel, "claude-1", "one"],
+          [1, secondModel, "claude-2", "two"],
+        ] as const) {
+          streamViaCli(
+            accountModel,
+            {
+              messages: [
+                ...ctx.messages,
+                {
+                  ...ourAssistant([{ type: "text", text: answer }]),
+                  provider: accountModel.provider,
+                },
+                { role: "user", content: "next" },
+              ],
+            },
+            opts("accounts", { account: { alias } }) as any,
+          );
+          await vi.advanceTimersByTimeAsync(0);
+          expect(spawn).toHaveBeenCalledTimes(2);
+          procAt(index).stdout.write(
+            startCycle({}) +
+              text("continued") +
+              endCycle("end_turn") +
+              result(),
+          );
+          await vi.advanceTimersByTimeAsync(10);
+        }
+      } finally {
+        process.env.PI_CODING_AGENT_DIR = originalAgentDir;
+      }
     });
 
-    it("marks rejected notices but never carries their limit state into a reused process's next turn", async () => {
+    it("surfaces rejected notices as fallback errors and never carries their state into a new process", async () => {
       process.env.PI_CLAUDE_CLI_CONTEXT = "pi";
       const ctx = { messages: [{ role: "user", content: "first" }] };
       streamViaCli(model, ctx, opts("limit-state") as any);
@@ -282,8 +365,11 @@ describe("persistent CLI process", () => {
           result(),
       );
       await vi.advanceTimersByTimeAsync(10);
-      const first = doneOf(0).message;
-      expect(first.stopReason).toBe("stop");
+      const first = MockStream.mock.instances[0]._events.find(
+        (event: any) => event.type === "error",
+      ).error;
+      expect(first.stopReason).toBe("error");
+      expect(first.errorMessage).toContain("rate limit");
       expect(first.diagnostics?.[0]).toMatchObject({
         type: "claude-limit",
         details: { status: "rejected" },
@@ -300,8 +386,8 @@ describe("persistent CLI process", () => {
         opts("limit-state") as any,
       );
       await vi.advanceTimersByTimeAsync(0);
-      expect(spawn).toHaveBeenCalledTimes(1);
-      proc.stdout.write(
+      expect(spawn).toHaveBeenCalledTimes(2);
+      procAt(1).stdout.write(
         result({
           subtype: "error",
           is_error: true,
@@ -345,7 +431,9 @@ describe("persistent CLI process", () => {
         (event: any) => event.type === "error",
       );
       expect(failure.error.stopReason).toBe("error");
-      expect(failure.error.errorMessage).toBe("Request refused");
+      expect(failure.error.errorMessage).toBe(
+        "Claude rate limit: request rejected. Request refused",
+      );
       expect(failure.error.diagnostics?.[0]).toMatchObject({
         type: "claude-limit",
         details: {

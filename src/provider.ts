@@ -24,6 +24,7 @@
 
 import {
   type AssistantMessageEventStream,
+  type AssistantMessage,
   createAssistantMessageEventStream,
   type Model,
   type SimpleStreamOptions,
@@ -49,7 +50,10 @@ import {
 } from "./process-manager.js";
 import { createEventBridge } from "./event-bridge.js";
 import { isTaskSubtype } from "./task-tracker.js";
-import { appendClaudeLimitDiagnostic } from "./rate-limit.js";
+import {
+  appendClaudeLimitDiagnostic,
+  normalizeClaudeLimitFailure,
+} from "./rate-limit.js";
 import type {
   ClaudeModelUsage,
   ClaudeRateLimitEvent,
@@ -88,9 +92,7 @@ import {
   replayPiMessages,
 } from "./pi-context.js";
 import {
-  assertAccountEnvironment,
-  claudeAccountIdentity,
-  defaultClaudeAccount,
+  claudeAccountForProvider,
   type ClaudeAccount,
 } from "./claude-accounts.js";
 
@@ -397,7 +399,9 @@ export function streamViaCli(
   options?: StreamViaCLiOptions,
 ): AssistantMessageEventStream {
   const stream = createAssistantMessageEventStream();
-  const account = { ...(options?.account ?? defaultClaudeAccount()) };
+  const account = {
+    ...(options?.account ?? claudeAccountForProvider(model.provider)),
+  };
   const piOwned = usesPiContext();
   // pi 0.86+ sends its prompt and tools as system messages and leaves
   // systemPrompt empty. Both policies read the current ones from there.
@@ -440,10 +444,14 @@ export function streamViaCli(
     // below can remove the right file. Only set when this attempt spawned.
     let promptFileKey: string | undefined;
     // The pi session, for parking.
-    const piSessionId = options?.sessionId;
+    const piSessionId = options?.sessionId
+      ? !["claude-1", "claude-2"].includes(model.provider) &&
+        account.alias === "claude-1"
+        ? options.sessionId
+        : JSON.stringify([model.provider, account.alias, options.sessionId])
+      : undefined;
 
     try {
-      assertAccountEnvironment(account);
       const cwd = options?.cwd ?? process.cwd();
       if (piOwned && piSessionId) {
         const oldId = getCliSession(piSessionId);
@@ -481,7 +489,7 @@ export function streamViaCli(
       // through control requests (step 1), so changing it mid-session no
       // longer costs a respawn and a full-history replay.
       const signature = JSON.stringify([
-        claudeAccountIdentity(account),
+        account.alias,
         model.id,
         systemPromptMode,
         piContext,
@@ -675,7 +683,7 @@ export function streamViaCli(
         if (streamEnded || resumeMiss) return;
         streamEnded = true;
         const output = bridge.getOutput();
-        const errorMessage = {
+        const errorMessage: AssistantMessage = {
           ...output,
           content: output.content?.length
             ? output.content
@@ -690,15 +698,17 @@ export function streamViaCli(
             true,
             options?.account?.alias,
           );
+        const limitFailure =
+          !aborted && normalizeClaudeLimitFailure(errorMessage, errMsg);
         stream.push(
-          piOwned
+          piOwned || limitFailure
             ? ({
                 type: "error",
                 reason: aborted ? "aborted" : "error",
                 error: {
                   ...errorMessage,
                   stopReason: aborted ? "aborted" : "error",
-                  errorMessage: errMsg,
+                  errorMessage: errorMessage.errorMessage ?? errMsg,
                 },
               } as any)
             : ({
@@ -1134,7 +1144,7 @@ export function streamViaCli(
         const piToolCalls = (output.content || []).filter(
           (c: any) => c.type === "toolCall",
         );
-        const effectiveReason =
+        let effectiveReason =
           output.stopReason === "toolUse" && piToolCalls.length === 0
             ? "stop"
             : output.stopReason;
@@ -1146,6 +1156,10 @@ export function streamViaCli(
             undefined,
             options?.account?.alias,
           );
+        if (!aborted && normalizeClaudeLimitFailure(output)) {
+          effectiveReason = "error";
+          void live.retire();
+        }
         if (piOwned) {
           const acknowledged = [...messages, output];
           live.piHistory = {
@@ -1158,6 +1172,11 @@ export function streamViaCli(
           };
         }
         streamEnded = true;
+        if (effectiveReason === "error") {
+          stream.push({ type: "error", reason: "error", error: output } as any);
+          stream.end();
+          return "ok";
+        }
         stream.push({
           type: "done",
           reason:

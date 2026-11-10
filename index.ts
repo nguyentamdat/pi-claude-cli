@@ -9,8 +9,10 @@ import { getBuiltinModels as getModels } from "@earendil-works/pi-ai/providers/a
 import { registerApiProvider } from "@earendil-works/pi-ai/compat";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { streamViaCli } from "./src/provider.js";
-import { cliRequestsActive } from "./src/provider.js";
-import { ClaudeAccounts } from "./src/claude-accounts.js";
+import {
+  claudeAccountsStatus,
+  claudeAccountForProvider,
+} from "./src/claude-accounts.js";
 import {
   validateCliPresence,
   validateCliAuth,
@@ -23,10 +25,7 @@ import {
 } from "./src/mcp-config.js";
 import { startHandoffBroker, stopHandoffBroker } from "./src/handoff-broker.js";
 import { cleanupRuntimeDir } from "./src/runtime-dir.js";
-import {
-  retireAllCliProcesses,
-  parkedCliProcessesBusy,
-} from "./src/cli-process.js";
+import { retireAllCliProcesses } from "./src/cli-process.js";
 import { cliThinkingLevelMap } from "./src/thinking-config.js";
 import { rewriteOverflowMessage } from "./src/overflow.js";
 import { buildRateLimitPayload, rateLimitIdentity } from "./src/rate-limit.js";
@@ -48,7 +47,7 @@ process.on("beforeExit", () => {
   void retireAllCliProcesses();
 });
 
-const PROVIDER_ID = "pi-claude-cli";
+const PROVIDER_IDS = ["pi-claude-cli", "claude-1", "claude-2"] as const;
 
 /**
  * Status key carrying account rate-limit state to the front-end. Neutral
@@ -200,7 +199,6 @@ async function ensureHandoffSocket(): Promise<string | undefined> {
 }
 
 export default function (pi: ExtensionAPI) {
-  const accounts = new ClaudeAccounts();
   try {
     // Startup validation
     validateCliPresence(); // throws if CLI not on PATH
@@ -227,8 +225,6 @@ export default function (pi: ExtensionAPI) {
     pi.on("session_start", async (_event: unknown, ctx: unknown) => {
       await retireAllCliProcesses();
       uiContext = ctx as typeof uiContext;
-      accounts.reset();
-      uiContext?.ui?.setStatus?.("claude-account", accounts.current().alias);
       uiContext?.ui?.setStatus?.(RATE_LIMIT_STATUS_KEY, undefined);
       uiContext?.ui?.setStatus?.(SUBAGENTS_STATUS_KEY, undefined);
       lastRateLimitJson = undefined;
@@ -243,57 +239,16 @@ export default function (pi: ExtensionAPI) {
       await retireAllCliProcesses();
     };
     pi.registerCommand("claude-account", {
-      description:
-        "Manual Claude profile: list, status, select account1|account2",
+      description: "Read-only Claude provider account status (no credentials)",
       handler: async (args, ctx) => {
-        try {
-          const words = args.trim().split(/\s+/);
-          const action = words[0] || "status";
-          if (action === "status" && words.length === 1) {
-            ctx.ui.notify(accounts.status(), "info");
-            return;
-          }
-          if (action === "list" && words.length === 1) {
-            ctx.ui.notify(accounts.list(), "info");
-            return;
-          }
-          const alias =
-            action === "select" && words.length === 2
-              ? words[1]
-              : words.length === 1
-                ? action
-                : undefined;
-          if (!alias)
-            throw new Error(
-              "Usage: /claude-account list|status|select <alias>",
-            );
-          if (!usesPiContext())
-            throw new Error(
-              "Manual Claude profile switching requires the default pi context policy, not legacy.",
-            );
-          const changed = accounts.select(
-            alias,
-            ctx.isIdle() && !cliRequestsActive() && !parkedCliProcessesBusy(),
-          );
-          if (changed) {
-            // Commit selection and empty the old pool synchronously before yielding.
-            // Requests starting during retirement already capture the new profile.
-            const retiring = retire();
-            ctx.ui.setStatus("claude-account", accounts.current().alias);
-            await retiring;
-          }
+        if (!["", "status", "list"].includes(args.trim())) {
           ctx.ui.notify(
-            `${accounts.status()}\nSession-local only; no login or model request. External /quota snapshots may still describe the default account.`,
-            "info",
-          );
-        } catch (error) {
-          ctx.ui.notify(
-            error instanceof Error
-              ? error.message
-              : "Claude profile selection failed.",
+            "Read-only command: /claude-account [status|list]. Select a provider with /model.",
             "warning",
           );
+          return;
         }
+        ctx.ui.notify(claudeAccountsStatus(), "info");
       },
     });
     pi.on("model_select", retire);
@@ -306,7 +261,7 @@ export default function (pi: ExtensionAPI) {
       context: Parameters<typeof streamViaCli>[1],
       options?: Parameters<typeof streamViaCli>[2],
     ) => {
-      const account = accounts.current();
+      const account = claudeAccountForProvider(model.provider);
       const schema = ensureMcpSchema(pi, context);
       // The socket start is async; the provider awaits it inside its own
       // driver so streamSimple still returns the stream synchronously.
@@ -327,24 +282,24 @@ export default function (pi: ExtensionAPI) {
     // and nested agent loops take that path and would throw
     // "No API provider registered for api: pi-claude-cli" (#32).
     // Register the custom api id there too.
-    registerApiProvider(
-      { api: PROVIDER_ID as any, stream: streamFn, streamSimple: streamFn },
-      PROVIDER_ID,
-    );
-
+    for (const providerId of PROVIDER_IDS) {
+      registerApiProvider(
+        { api: providerId as any, stream: streamFn, streamSimple: streamFn },
+        providerId,
+      );
+      pi.registerProvider(providerId, {
+        baseUrl: "pi-claude-cli",
+        apiKey: "unused",
+        api: providerId,
+        models,
+        streamSimple: streamFn,
+      });
+    }
     // Overflow recovery: rewrite provider-scoped context-limit errors to
     // the prefix pi's auto-compaction recognizes (see src/overflow.ts).
 
     (pi.on as any)("message_end", (event: any, ctx: any) => {
       return rewriteOverflowMessage(event?.message ?? {}, ctx?.model?.provider);
-    });
-
-    pi.registerProvider(PROVIDER_ID, {
-      baseUrl: "pi-claude-cli",
-      apiKey: "unused",
-      api: "pi-claude-cli",
-      models,
-      streamSimple: streamFn,
     });
   } catch (err) {
     console.error(`[pi-claude-cli] Failed to register provider:`, err);

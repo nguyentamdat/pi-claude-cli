@@ -72,8 +72,35 @@ export function rateLimitIdentity(payload: RateLimitPayload): string {
 
 // The CLI sometimes returns its quota notice as a successful assistant stop.
 const CLI_LIMIT_NOTICE =
-  /^(?:Error:\s*)?(?:you(?:'|’)ve|you have) (?:hit|reached) your (?:[\w-]+ )?limit(?:\s*[·—–\-:,.]|\s*$)/i;
+  /^(?:Error:\s*)?(?:you(?:'|’)ve|you have) (?:hit|reached) your (?:(?!context|token|output)[\w-]+ )?limit(?:\s*[·—–\-:,.]|\s*$)/i;
 
+/** Fallback extensions recognize errorMessage rate-limit text for every provider id. */
+export function normalizeClaudeLimitFailure(
+  message: AssistantMessage,
+  failureText?: string,
+): boolean {
+  if (message.stopReason !== "stop" && message.stopReason !== "error")
+    return false;
+  const rejected = message.diagnostics?.some(
+    (item) =>
+      item.type === "claude-limit" && item.details?.status === "rejected",
+  );
+  const textOnly = message.content.every((part) => part.type === "text");
+  const text = message.content
+    .map((part) => (part.type === "text" ? part.text : ""))
+    .join("\n")
+    .trim();
+  const notice = textOnly && text.length <= 500 && CLI_LIMIT_NOTICE.test(text);
+  const failure =
+    failureText &&
+    /rate[ _-]?limit|too many requests|\b429\b|insufficient_quota|quota.{0,30}(?:exceeded|exhausted|reached)|(?:usage|subscription|weekly|daily) limit/i.test(
+      failureText,
+    );
+  if (!rejected && !notice && !failure) return false;
+  message.stopReason = "error";
+  message.errorMessage = `Claude rate limit: request rejected.${failureText ? ` ${failureText}` : ""}`;
+  return true;
+}
 /** Persist a rejected request in Pi's native diagnostics, without changing turn semantics. */
 export function appendClaudeLimitDiagnostic(
   message: AssistantMessage,

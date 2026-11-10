@@ -1,5 +1,13 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { readFileSync } from "node:fs";
+import {
+  readFileSync,
+  mkdtempSync,
+  mkdirSync,
+  writeFileSync,
+  rmSync,
+} from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 vi.mock("cross-spawn", () => ({ default: vi.fn(() => ({})) }));
 vi.mock("node:child_process", () => ({
   execSync: vi.fn(() => Buffer.from("2.1.263 (Claude Code)")),
@@ -56,34 +64,72 @@ describe("default pi-owned launch", () => {
     expect(process.env.CLAUDE_CODE_DISABLE_CLAUDE_MDS).toBe("0");
   });
 
-  it("uses the selected profile only in the child and restores an originally unset default without mutating Pi", () => {
-    delete process.env.PI_CLAUDE_CLI_CONTEXT;
+  it("isolates child account env, clears inherited token/default directory and rereads files at spawn", () => {
+    const dir = mkdtempSync(join(tmpdir(), "claude-spawn-"));
+    mkdirSync(join(dir, "claude-accounts"));
+    const profile = join(dir, "profile");
+    mkdirSync(profile);
+    vi.stubEnv("PI_CODING_AGENT_DIR", dir);
     vi.stubEnv("CLAUDE_CONFIG_DIR", "/inherited/default");
-    spawnClaude("claude-haiku-4-5", undefined, {
-      account: { alias: "account2", configDir: "/isolated/profile" },
-    });
-    expect(vi.mocked(spawn).mock.calls[0][2]?.env?.CLAUDE_CONFIG_DIR).toBe(
-      "/isolated/profile",
-    );
-    expect(process.env.CLAUDE_CONFIG_DIR).toBe("/inherited/default");
-    spawnClaude("claude-haiku-4-5", undefined, {
-      account: { alias: "account1" },
-    });
-    expect(vi.mocked(spawn).mock.calls[1][2]?.env).not.toHaveProperty(
-      "CLAUDE_CONFIG_DIR",
-    );
-    expect(process.env.CLAUDE_CONFIG_DIR).toBe("/inherited/default");
-  });
-
-  it("refuses a selected profile if a token override appears later, without exposing or deleting it", () => {
-    vi.stubEnv("CLAUDE_CODE_OAUTH_TOKEN", "secret-sentinel");
-    expect(() =>
+    vi.stubEnv("CLAUDE_CODE_OAUTH_TOKEN", "inherited-secret");
+    try {
+      writeFileSync(
+        join(dir, "claude-accounts", "claude-2.json"),
+        JSON.stringify({
+          env: {
+            CLAUDE_CODE_OAUTH_TOKEN: "account-two-secret",
+            CLAUDE_CONFIG_DIR: profile,
+          },
+        }),
+        { mode: 0o600 },
+      );
       spawnClaude("claude-haiku-4-5", undefined, {
-        account: { alias: "account2", configDir: "/isolated/profile" },
-      }),
-    ).toThrow("CLAUDE_CODE_OAUTH_TOKEN");
-    expect(spawn).not.toHaveBeenCalled();
-    expect(process.env.CLAUDE_CODE_OAUTH_TOKEN).toBe("secret-sentinel");
+        account: { alias: "claude-2" },
+      });
+      expect(vi.mocked(spawn).mock.calls[0][2]?.env).toMatchObject({
+        CLAUDE_CONFIG_DIR: profile,
+        CLAUDE_CODE_OAUTH_TOKEN: "account-two-secret",
+      });
+      spawnClaude("claude-haiku-4-5", undefined, {
+        account: { alias: "claude-1" },
+      });
+      expect(vi.mocked(spawn).mock.calls[1][2]?.env).not.toHaveProperty(
+        "CLAUDE_CONFIG_DIR",
+      );
+      expect(vi.mocked(spawn).mock.calls[1][2]?.env).not.toHaveProperty(
+        "CLAUDE_CODE_OAUTH_TOKEN",
+      );
+      writeFileSync(
+        join(dir, "claude-accounts", "claude-2.json"),
+        JSON.stringify({ env: { CLAUDE_CODE_OAUTH_TOKEN: "updated-secret" } }),
+      );
+      spawnClaude("claude-haiku-4-5", undefined, {
+        account: { alias: "claude-2" },
+      });
+      expect(
+        vi.mocked(spawn).mock.calls[2][2]?.env?.CLAUDE_CODE_OAUTH_TOKEN,
+      ).toBe("updated-secret");
+      expect(process.env.CLAUDE_CONFIG_DIR).toBe("/inherited/default");
+      expect(process.env.CLAUDE_CODE_OAUTH_TOKEN).toBe("inherited-secret");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+  it("refuses missing claude-2 before spawning, without exposing inherited credentials", () => {
+    const dir = mkdtempSync(join(tmpdir(), "claude-missing-"));
+    vi.stubEnv("PI_CODING_AGENT_DIR", dir);
+    vi.stubEnv("CLAUDE_CODE_OAUTH_TOKEN", "secret-sentinel");
+    try {
+      expect(() =>
+        spawnClaude("claude-haiku-4-5", undefined, {
+          account: { alias: "claude-2" },
+        }),
+      ).toThrow("claude-2: account file missing");
+      expect(spawn).not.toHaveBeenCalled();
+      expect(process.env.CLAUDE_CODE_OAUTH_TOKEN).toBe("secret-sentinel");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
   it("passes --no-session-persistence once, with or without PI_CLAUDE_CLI_EPHEMERAL", () => {
     // A host's one-shots (session naming) set the ephemeral flag on top of
