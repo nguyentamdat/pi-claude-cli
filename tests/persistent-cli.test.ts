@@ -6,6 +6,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { EventEmitter } from "node:events";
 import { PassThrough } from "node:stream";
+import { cliRequestsActive } from "../src/provider";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -54,6 +55,7 @@ import { streamViaCli } from "../src/provider";
 import {
   resetCliProcessesForTests,
   parkedCliProcessCount,
+  parkedCliProcessesBusy,
 } from "../src/cli-process";
 import {
   dispatchHandoffCall,
@@ -204,6 +206,60 @@ describe("persistent CLI process", () => {
           text("two") +
           endCycle("end_turn") +
           result({}),
+      );
+      await vi.advanceTimersByTimeAsync(10);
+      expect(doneOf(1).message.stopReason).toBe("stop");
+    });
+
+    it("retires a warm process on profile identity changes and scopes only the child's environment", async () => {
+      delete process.env.PI_CLAUDE_CLI_CONTEXT;
+      const inherited = process.env.CLAUDE_CONFIG_DIR;
+      const ctx = { messages: [{ role: "user", content: "first" }] };
+      streamViaCli(
+        model,
+        ctx,
+        opts("profile-switch", {
+          account: { alias: "account1", configDir: inherited },
+        }) as any,
+      );
+      expect(cliRequestsActive()).toBe(true);
+      await vi.advanceTimersByTimeAsync(0);
+      const first = procAt(0);
+      first.stdout.write(
+        startCycle({ input_tokens: 1 }) +
+          text("one") +
+          endCycle("end_turn") +
+          result(),
+      );
+      await vi.advanceTimersByTimeAsync(10);
+      expect(cliRequestsActive()).toBe(false);
+      expect(parkedCliProcessesBusy()).toBe(false);
+      streamViaCli(
+        model,
+        {
+          messages: [
+            ...ctx.messages,
+            ourAssistant(doneOf(0).message.content),
+            { role: "user", content: "next" },
+          ],
+        },
+        opts("profile-switch", {
+          account: { alias: "account2", configDir: "/isolated/profile" },
+        }) as any,
+      );
+      await vi.advanceTimersByTimeAsync(600);
+      expect(first.stdin.end).toHaveBeenCalled();
+      expect(spawn).toHaveBeenCalledTimes(2);
+      expect((spawn as any).mock.calls[1][2].env.CLAUDE_CONFIG_DIR).toBe(
+        "/isolated/profile",
+      );
+      expect(process.env.CLAUDE_CONFIG_DIR).toBe(inherited);
+      const second = procAt(1);
+      second.stdout.write(
+        startCycle({ input_tokens: 1 }) +
+          text("two") +
+          endCycle("end_turn") +
+          result(),
       );
       await vi.advanceTimersByTimeAsync(10);
       expect(doneOf(1).message.stopReason).toBe("stop");
@@ -660,6 +716,8 @@ describe("persistent CLI process", () => {
       expect(written(proc).join("")).not.toContain('"interrupt"');
       expect(proc.kill).not.toHaveBeenCalled();
       expect(parkedCliProcessCount()).toBe(1);
+      expect(cliRequestsActive()).toBe(false);
+      expect(parkedCliProcessesBusy()).toBe(true);
 
       // The CLI asks permission (allowed) and calls the tool over MCP.
       proc.stdout.write(

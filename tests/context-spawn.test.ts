@@ -56,6 +56,35 @@ describe("default pi-owned launch", () => {
     expect(process.env.CLAUDE_CODE_DISABLE_CLAUDE_MDS).toBe("0");
   });
 
+  it("uses the selected profile only in the child and restores an originally unset default without mutating Pi", () => {
+    delete process.env.PI_CLAUDE_CLI_CONTEXT;
+    vi.stubEnv("CLAUDE_CONFIG_DIR", "/inherited/default");
+    spawnClaude("claude-haiku-4-5", undefined, {
+      account: { alias: "account2", configDir: "/isolated/profile" },
+    });
+    expect(vi.mocked(spawn).mock.calls[0][2]?.env?.CLAUDE_CONFIG_DIR).toBe(
+      "/isolated/profile",
+    );
+    expect(process.env.CLAUDE_CONFIG_DIR).toBe("/inherited/default");
+    spawnClaude("claude-haiku-4-5", undefined, {
+      account: { alias: "account1" },
+    });
+    expect(vi.mocked(spawn).mock.calls[1][2]?.env).not.toHaveProperty(
+      "CLAUDE_CONFIG_DIR",
+    );
+    expect(process.env.CLAUDE_CONFIG_DIR).toBe("/inherited/default");
+  });
+
+  it("refuses a selected profile if a token override appears later, without exposing or deleting it", () => {
+    vi.stubEnv("CLAUDE_CODE_OAUTH_TOKEN", "secret-sentinel");
+    expect(() =>
+      spawnClaude("claude-haiku-4-5", undefined, {
+        account: { alias: "account2", configDir: "/isolated/profile" },
+      }),
+    ).toThrow("CLAUDE_CODE_OAUTH_TOKEN");
+    expect(spawn).not.toHaveBeenCalled();
+    expect(process.env.CLAUDE_CODE_OAUTH_TOKEN).toBe("secret-sentinel");
+  });
   it("passes --no-session-persistence once, with or without PI_CLAUDE_CLI_EPHEMERAL", () => {
     // A host's one-shots (session naming) set the ephemeral flag on top of
     // the default; the two reasons for the flag must not stack it.

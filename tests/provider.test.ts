@@ -82,7 +82,11 @@ import { resetCliProcessesForTests } from "../src/cli-process";
 describe("provider registration (default export)", () => {
   it("registers provider with ID pi-claude-cli", async () => {
     const registerProvider = vi.fn();
-    const mockPi = { registerProvider, on: vi.fn() } as any;
+    const mockPi = {
+      registerProvider,
+      registerCommand: vi.fn(),
+      on: vi.fn(),
+    } as any;
 
     // Dynamic import to get the default export
     const mod = await import("../index");
@@ -94,7 +98,11 @@ describe("provider registration (default export)", () => {
 
   it("registers provider with correct config shape", async () => {
     const registerProvider = vi.fn();
-    const mockPi = { registerProvider, on: vi.fn() } as any;
+    const mockPi = {
+      registerProvider,
+      registerCommand: vi.fn(),
+      on: vi.fn(),
+    } as any;
 
     const mod = await import("../index");
     mod.default(mockPi);
@@ -111,7 +119,11 @@ describe("provider registration (default export)", () => {
 
   it("derives models from getModels('anthropic') with correct fields", async () => {
     const registerProvider = vi.fn();
-    const mockPi = { registerProvider, on: vi.fn() } as any;
+    const mockPi = {
+      registerProvider,
+      registerCommand: vi.fn(),
+      on: vi.fn(),
+    } as any;
 
     const mod = await import("../index");
     mod.default(mockPi);

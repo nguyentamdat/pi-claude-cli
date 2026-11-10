@@ -87,6 +87,17 @@ import {
   historyHash,
   replayPiMessages,
 } from "./pi-context.js";
+import {
+  assertAccountEnvironment,
+  claudeAccountIdentity,
+  defaultClaudeAccount,
+  type ClaudeAccount,
+} from "./claude-accounts.js";
+
+let activeRequests = 0;
+export function cliRequestsActive(): boolean {
+  return activeRequests > 0;
+}
 
 /**
  * Inactivity timeout. CLI-side tool executions (web search, user MCP
@@ -206,6 +217,7 @@ function handoffProxyAllowed(): boolean {
 
 /** Extended stream options: pi's SimpleStreamOptions plus host plumbing. */
 type StreamViaCLiOptions = SimpleStreamOptions & {
+  account?: ClaudeAccount;
   cwd?: string;
   /** Pre-built `--mcp-config` file used verbatim (tests, legacy hosts). */
   mcpConfigPath?: string;
@@ -385,6 +397,7 @@ export function streamViaCli(
   options?: StreamViaCLiOptions,
 ): AssistantMessageEventStream {
   const stream = createAssistantMessageEventStream();
+  const account = { ...(options?.account ?? defaultClaudeAccount()) };
   const piOwned = usesPiContext();
   // pi 0.86+ sends its prompt and tools as system messages and leaves
   // systemPrompt empty. Both policies read the current ones from there.
@@ -430,6 +443,7 @@ export function streamViaCli(
     const piSessionId = options?.sessionId;
 
     try {
+      assertAccountEnvironment(account);
       const cwd = options?.cwd ?? process.cwd();
       if (piOwned && piSessionId) {
         const oldId = getCliSession(piSessionId);
@@ -467,6 +481,7 @@ export function streamViaCli(
       // through control requests (step 1), so changing it mid-session no
       // longer costs a respawn and a full-history replay.
       const signature = JSON.stringify([
+        claudeAccountIdentity(account),
         model.id,
         systemPromptMode,
         piContext,
@@ -584,6 +599,7 @@ export function streamViaCli(
             : undefined);
 
         const proc = spawnClaude(model.id, systemPrompt || undefined, {
+          account,
           cwd,
           signal: options?.signal,
           thinking,
@@ -668,7 +684,12 @@ export function streamViaCli(
         };
         // Legacy mode reports failures as stops; retain that behavior.
         if (!aborted)
-          appendClaudeLimitDiagnostic(errorMessage, latestRateLimitInfo, true);
+          appendClaudeLimitDiagnostic(
+            errorMessage,
+            latestRateLimitInfo,
+            true,
+            options?.account?.alias,
+          );
         stream.push(
           piOwned
             ? ({
@@ -1118,7 +1139,13 @@ export function streamViaCli(
             ? "stop"
             : output.stopReason;
 
-        if (!aborted) appendClaudeLimitDiagnostic(output, latestRateLimitInfo);
+        if (!aborted)
+          appendClaudeLimitDiagnostic(
+            output,
+            latestRateLimitInfo,
+            undefined,
+            options?.account?.alias,
+          );
         if (piOwned) {
           const acknowledged = [...messages, output];
           live.piHistory = {
@@ -1156,6 +1183,7 @@ export function streamViaCli(
     }
   }
 
+  activeRequests++;
   (async () => {
     try {
       const outcome = await runOnce(false);
@@ -1194,6 +1222,7 @@ export function streamViaCli(
       } as any);
       stream.end();
     } finally {
+      activeRequests--;
       // The sub-agent channel is state ABOUT a turn, so it must not outlive
       // one. Left standing, the last snapshot pins whatever the agents were
       // doing when the episode ended — a host then shows "running" for

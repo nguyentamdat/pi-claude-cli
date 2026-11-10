@@ -68,6 +68,12 @@ describe("buildRateLimitPayload", () => {
 });
 
 describe("rateLimitIdentity", () => {
+  it("distinguishes identical quota state reported by different manual profiles", () => {
+    const first = buildRateLimitPayload(OVER_CREDITS, 1000, "account1");
+    const second = buildRateLimitPayload(OVER_CREDITS, 1000, "account2");
+    expect(rateLimitIdentity(first)).not.toBe(rateLimitIdentity(second));
+    expect(second.account).toBe("account2");
+  });
   const at = (seconds: number) => buildRateLimitPayload(OVER_CREDITS, seconds);
 
   it("ignores observedAt, so a repeated event is not a change", () => {

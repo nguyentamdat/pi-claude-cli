@@ -18,6 +18,33 @@ Requires Node 22+, pi, and an authenticated `claude` binary on PATH (Claude Code
 - **Storage:** default Claude processes use `--no-session-persistence`. No new Claude conversation file, resume pairing or saved system-prompt sidecar is created. Private temporary prompt and MCP files are removed when no longer needed; the runtime directory is removed on process exit. A SIGKILL can leave its private temporary directory behind.
 - **Compaction:** pi compacts its own history normally. CLI auto-compaction is disabled. Hosts must not switch off pi compaction just because this provider is selected.
 
+## Manual Claude account switching
+
+`/claude-account status` shows the selected **profile alias and directory only**, not an authenticated identity. `/claude-account list` lists configured aliases. Start on `account1`, the official CLI's existing default (including an inherited `CLAUDE_CONFIG_DIR`, if set). Nothing switches automatically on quota errors.
+
+Create `~/.pi/agent/claude-accounts.json` (or `$PI_CODING_AGENT_DIR/claude-accounts.json`, overridable with `PI_CLAUDE_CLI_ACCOUNTS_FILE`) containing only aliases and absolute paths to **already authenticated official CLI profiles**:
+
+```json
+{
+  "account2": "/absolute/path/to/your/second/claude-profile"
+}
+```
+
+Then, while Pi is idle:
+
+```text
+/claude-account select account2
+/claude-account account1
+```
+
+The short form `/claude-account account2` also selects it. `account1` is reserved; do not put it in the map. No login, logout, token entry, credential copy or global authentication/settings write is performed. The official CLI continues to manage its own authentication normally. This command is supported by Pi's TUI and native RPC `prompt` dispatch (`get_commands` lists it); an external host must forward the slash text unchanged with command expansion enabled. Hosts that send it only as conversation text cannot switch accounts. HSA-specific forwarding is not verified here.
+
+Selection is in memory for this extension runtime/session only. `/reload`, `/new`, `/resume`, forks and separately spawned Pi subagents start at `account1`; selection does not propagate through the parent's environment. Nested requests using the **same in-process provider registration** inherit its current selection, captured at request start. Other running Pi processes, the dashboard and global settings are unaffected. This feature requires the default pi context policy, not `legacy`.
+
+Busy switches are rejected (generation, retry, tool execution or parked handoff); finish or cancel the run and retry. A successful switch retires old warm processes, clears this provider's rate-limit/subagent status, and reimports Pi's history on the next request. Warm signatures include profile identity; the child alone receives `CLAUDE_CONFIG_DIR`, so returning to `account1` restores its original unset/explicit default without a `process.env` race. Token/API-key/keychain-location or alternate-cloud environment overrides block switching with variable **names only** in the warning; they are never deleted or overwritten.
+
+The model catalog remains Pi's static Anthropic catalog, not a profile-specific entitlement check. Provider rate-limit events and rejection diagnostics carry the profile alias; each request starts without the previous account's rejection state. Independent host quota monitors (such as shared `/quota` snapshots) may still read the default account: do not treat them as the selected profile's quota. A host's existing cross-provider fallback/restore policy is not changed: if it switched away from Claude, cancel its pending restore with `/model-fallback stay` when available and explicitly choose a `pi-claude-cli` model. This command never auto-selects a model or retries inference.
+
 ## Switching providers
 
 Claude → native pi → Claude uses the same pi session. Switching models retires the parked Claude process and clears its UI status. Switching back imports pi's current context, including native-provider turns, full tool results and images. Branch navigation and compaction cannot resume a stale Claude transcript.

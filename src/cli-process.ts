@@ -604,6 +604,12 @@ export function takeParkedCliProcess(
   return cli;
 }
 
+/** A parked handoff is still an active turn, even between provider episodes. */
+export function parkedCliProcessesBusy(): boolean {
+  return [...parked.values()].some(
+    (cli) => cli.alive && !cli.retired && (cli.turnActive || cli.attached),
+  );
+}
 export function parkedCliProcessCount(): number {
   return parked.size;
 }

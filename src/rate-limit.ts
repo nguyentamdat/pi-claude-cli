@@ -18,6 +18,8 @@ import type { ClaudeRateLimitEvent } from "./types.js";
 
 /** What the host receives under the `claude-rate-limit` status key. */
 export interface RateLimitPayload {
+  /** Manual profile alias, when the extension supplied one (never credential metadata). */
+  account?: string;
   status: unknown;
   resetsAt: unknown;
   rateLimitType: unknown;
@@ -37,8 +39,10 @@ function num(value: unknown): number | null {
 export function buildRateLimitPayload(
   info: Record<string, unknown>,
   nowSeconds: number = Math.floor(Date.now() / 1000),
+  account?: string,
 ): RateLimitPayload {
   return {
+    ...(account ? { account } : {}),
     status: info.status,
     resetsAt: info.resetsAt,
     rateLimitType: info.rateLimitType,
@@ -75,6 +79,7 @@ export function appendClaudeLimitDiagnostic(
   message: AssistantMessage,
   info: ClaudeRateLimitEvent["rate_limit_info"],
   failed = message.stopReason === "error",
+  account?: string,
 ): void {
   // A rejected nested window/overage alone does not mean the request was refused.
   if (info?.status !== "rejected") return;
@@ -94,6 +99,7 @@ export function appendClaudeLimitDiagnostic(
     type: "claude-limit",
     timestamp: Date.now(),
     details: {
+      ...(account ? { account } : {}),
       status: "rejected",
       ...(typeof info.rateLimitType === "string"
         ? { rateLimitType: info.rateLimitType }
